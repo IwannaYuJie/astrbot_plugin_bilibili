@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from pathlib import Path
 from typing import Any
 
@@ -145,10 +146,13 @@ class BilibiliReplyPlugin(Star):
         return str(self.config.get("bilibili_uid", "") or "").strip()
 
     def _scan_video_limit(self) -> int:
-        return int(self.config.get("scan_video_limit", 3) or 3)
+        return int(self.config.get("scan_video_limit", 10) or 10)
 
     def _scan_comment_page_size(self) -> int:
-        return int(self.config.get("scan_comment_page_size", 10) or 10)
+        return int(self.config.get("scan_comment_page_size", 20) or 20)
+
+    def _scan_comment_page_limit(self) -> int:
+        return int(self.config.get("scan_comment_page_limit", 2) or 2)
 
     @staticmethod
     def _is_mention(message: str, uname: str) -> bool:
@@ -157,6 +161,37 @@ class BilibiliReplyPlugin(Star):
         if not text or not target:
             return False
         return f"@{target}" in text or f"＠{target}" in text
+
+    def _build_comment_preview(
+        self,
+        *,
+        reply: dict[str, Any],
+        aid: str,
+        bvid: str,
+        title: str,
+        self_mid: str,
+        self_uname: str,
+    ) -> BiliCommentPreview | None:
+        member = reply.get("member", {}) or {}
+        content = reply.get("content", {}) or {}
+        user_mid = str(member.get("mid", "") or "")
+        user_name = str(member.get("uname", "") or "")
+        message = str(content.get("message", "") or "").strip()
+        if not message:
+            return None
+        if self_mid and user_mid == self_mid:
+            return None
+        return BiliCommentPreview(
+            comment_id=str(reply.get("rpid", "") or ""),
+            aid=aid,
+            bvid=bvid,
+            video_title=title,
+            user_name=user_name,
+            user_mid=user_mid,
+            message=message,
+            ctime=int(reply.get("ctime", 0) or 0),
+            mentioned=self._is_mention(message, self_uname),
+        )
 
     async def _scan_recent_mentions(self) -> tuple[dict[str, Any], list[BiliCommentPreview]]:
         uid = self._configured_uid()
@@ -171,61 +206,90 @@ class BilibiliReplyPlugin(Star):
         self_mid = str(nav_data.get("mid", "") or "")
         self_uname = str(nav_data.get("uname", "") or "").strip()
 
-        videos = await client.get_video_list(
-            uid=uid,
-            page=1,
-            page_size=self._scan_video_limit(),
-        )
-        vlist = (
-            videos.get("data", {})
-            .get("list", {})
-            .get("vlist", [])
-            if isinstance(videos, dict)
-            else []
-        )
+        target_video_limit = self._scan_video_limit()
+        page_size = min(target_video_limit, 20) if target_video_limit > 0 else 10
+        video_pages = max(1, math.ceil(target_video_limit / page_size))
+
+        vlist: list[dict[str, Any]] = []
+        for page in range(1, video_pages + 1):
+            videos = await client.get_video_list(uid=uid, page=page, page_size=page_size)
+            page_vlist = (
+                videos.get("data", {})
+                .get("list", {})
+                .get("vlist", [])
+                if isinstance(videos, dict)
+                else []
+            )
+            if not page_vlist:
+                break
+            for video in page_vlist:
+                if isinstance(video, dict):
+                    vlist.append(video)
+                    if len(vlist) >= target_video_limit:
+                        break
+            if len(vlist) >= target_video_limit:
+                break
 
         previews: list[BiliCommentPreview] = []
+        video_debug: list[dict[str, Any]] = []
         for video in vlist:
-            if not isinstance(video, dict):
-                continue
             aid = str(video.get("aid", "") or "")
             bvid = str(video.get("bvid", "") or "")
             title = str(video.get("title", "") or "")
             if not aid:
                 continue
 
-            comments = await client.get_video_comments(
-                aid=aid,
-                page=1,
-                page_size=self._scan_comment_page_size(),
-            )
-            replies = comments.get("data", {}).get("replies", []) if isinstance(comments, dict) else []
-            for reply in replies or []:
-                if not isinstance(reply, dict):
-                    continue
-                member = reply.get("member", {}) or {}
-                content = reply.get("content", {}) or {}
-                user_mid = str(member.get("mid", "") or "")
-                user_name = str(member.get("uname", "") or "")
-                message = str(content.get("message", "") or "").strip()
-                if not message:
-                    continue
-                if self_mid and user_mid == self_mid:
-                    continue
-                mentioned = self._is_mention(message, self_uname)
-                previews.append(
-                    BiliCommentPreview(
-                        comment_id=str(reply.get("rpid", "") or ""),
+            per_video_count = 0
+            for page in range(1, self._scan_comment_page_limit() + 1):
+                comments = await client.get_video_comments(
+                    aid=aid,
+                    page=page,
+                    page_size=self._scan_comment_page_size(),
+                )
+                replies = comments.get("data", {}).get("replies", []) if isinstance(comments, dict) else []
+                if not replies:
+                    break
+                for reply in replies or []:
+                    if not isinstance(reply, dict):
+                        continue
+                    preview = self._build_comment_preview(
+                        reply=reply,
                         aid=aid,
                         bvid=bvid,
-                        video_title=title,
-                        user_name=user_name,
-                        user_mid=user_mid,
-                        message=message,
-                        ctime=int(reply.get("ctime", 0) or 0),
-                        mentioned=mentioned,
+                        title=title,
+                        self_mid=self_mid,
+                        self_uname=self_uname,
                     )
-                )
+                    if preview:
+                        previews.append(preview)
+                        per_video_count += 1
+
+                    for sub_reply in (reply.get("replies", []) or []):
+                        if not isinstance(sub_reply, dict):
+                            continue
+                        sub_preview = self._build_comment_preview(
+                            reply=sub_reply,
+                            aid=aid,
+                            bvid=bvid,
+                            title=title,
+                            self_mid=self_mid,
+                            self_uname=self_uname,
+                        )
+                        if sub_preview:
+                            previews.append(sub_preview)
+                            per_video_count += 1
+
+                if len(replies) < self._scan_comment_page_size():
+                    break
+
+            video_debug.append(
+                {
+                    "title": title,
+                    "bvid": bvid,
+                    "aid": aid,
+                    "comment_count": per_video_count,
+                }
+            )
 
         meta = {
             "self_mid": self_mid,
@@ -233,6 +297,7 @@ class BilibiliReplyPlugin(Star):
             "video_count": len(vlist),
             "comment_count": len(previews),
             "mention_count": len([item for item in previews if item.mentioned]),
+            "video_debug": video_debug,
         }
         return meta, previews
 
@@ -254,6 +319,7 @@ class BilibiliReplyPlugin(Star):
             f"- provider_id_configured: {bool(provider_id)}\n"
             f"- scan_video_limit: {self._scan_video_limit()}\n"
             f"- scan_comment_page_size: {self._scan_comment_page_size()}\n"
+            f"- scan_comment_page_limit: {self._scan_comment_page_limit()}\n"
             f"- plugin_data_dir: {self.plugin_data_dir}"
         )
 
@@ -387,6 +453,47 @@ class BilibiliReplyPlugin(Star):
                 f"  comment_id={item.comment_id} bvid={item.bvid}\n"
                 f"  {item.message[:160]}"
             )
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("bili_scan_debug")
+    async def bili_scan_debug(self, event: AstrMessageEvent):
+        """输出更详细的扫描调试信息。"""
+        try:
+            meta, previews = await self._scan_recent_mentions()
+        except httpx.HTTPStatusError as e:
+            logger.exception("B站扫描 HTTP 错误")
+            yield event.plain_result(f"B站扫描失败：HTTP {e.response.status_code}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("B站扫描异常")
+            yield event.plain_result(f"B站扫描失败：{e}")
+            return
+
+        lines = [
+            "B站扫描 Debug",
+            f"- self_uname: {meta.get('self_uname') or '未知'}",
+            f"- self_mid: {meta.get('self_mid') or '未知'}",
+            f"- scanned_videos: {meta.get('video_count', 0)}",
+            f"- scanned_comments: {meta.get('comment_count', 0)}",
+            f"- matched_mentions: {meta.get('mention_count', 0)}",
+            "",
+            "视频扫描明细：",
+        ]
+        for item in meta.get("video_debug", [])[:10]:
+            lines.append(
+                f"- {str(item.get('title', ''))[:30]} | bvid={item.get('bvid')} | comments={item.get('comment_count', 0)}"
+            )
+
+        if previews:
+            lines.append("")
+            lines.append("评论样本（最多 10 条）：")
+            for item in previews[:10]:
+                flag = "[命中@]" if item.mentioned else "[未命中]"
+                lines.append(f"{flag} {item.user_name}: {item.message[:100]}")
+        else:
+            lines.append("")
+            lines.append("没有读到任何评论样本。")
 
         yield event.plain_result("\n".join(lines))
 

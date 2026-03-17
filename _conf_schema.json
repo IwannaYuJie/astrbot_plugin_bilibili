@@ -68,12 +68,17 @@
   "scan_video_limit": {
     "type": "int",
     "description": "只读扫描时最多检查多少个最新视频",
-    "default": 3
+    "default": 10
   },
   "scan_comment_page_size": {
     "type": "int",
     "description": "每个视频只读扫描多少条最新评论",
-    "default": 10
+    "default": 20
+  },
+  "scan_comment_page_limit": {
+    "type": "int",
+    "description": "每个视频最多扫描多少页评论（只读调试用）",
+    "default": 2
   },
   "http_timeout_seconds": {
     "type": "int",
