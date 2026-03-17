@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
+import re
+import time
 from dataclasses import dataclass
 from datetime import datetime
-import math
+from hashlib import md5
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode, urlparse
 
 import httpx
 from astrbot.api import AstrBotConfig, logger
@@ -35,17 +39,26 @@ class BiliCommentPreview:
 
 
 class BilibiliApiClient:
-    """B站 API 的最小客户端。
+    """B站 API 最小客户端。
 
     当前版本实现：
     - 读取登录态
-    - 读取视频列表
+    - 通过 WBI 读取视频列表
     - 读取视频评论（只读）
     """
+
+    _MIXIN_KEY_ENC_TAB = [
+        46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+        27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+        37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+        22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
+    ]
 
     def __init__(self, cookie: str, timeout: int = 20):
         self.cookie = cookie.strip()
         self.timeout = timeout
+        self._nav_cache: dict[str, Any] | None = None
+        self._wbi_keys_cache: tuple[str, str] | None = None
 
     @staticmethod
     def _parse_cookie(cookie_str: str) -> dict[str, str]:
@@ -65,33 +78,87 @@ class BilibiliApiClient:
     def is_configured(self) -> bool:
         return bool(self.cookie)
 
-    async def _request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
-        headers = {
+    def _headers(self) -> dict[str, str]:
+        return {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Referer": "https://www.bilibili.com/",
+            "Origin": "https://www.bilibili.com",
         }
-        cookies = self._parse_cookie(self.cookie)
 
-        async with httpx.AsyncClient(timeout=self.timeout, headers=headers, cookies=cookies) as client:
+    async def _request(self, method: str, url: str, **kwargs: Any) -> dict[str, Any]:
+        cookies = self._parse_cookie(self.cookie)
+        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers(), cookies=cookies) as client:
             response = await client.request(method, url, **kwargs)
             response.raise_for_status()
             return response.json()
 
     async def get_login_info(self) -> dict[str, Any]:
-        return await self._request("GET", "https://api.bilibili.com/x/web-interface/nav")
+        if self._nav_cache is None:
+            self._nav_cache = await self._request("GET", "https://api.bilibili.com/x/web-interface/nav")
+        return self._nav_cache
+
+    @staticmethod
+    def _extract_wbi_key(url: str) -> str:
+        path = urlparse(url).path
+        return path.rsplit("/", 1)[-1].split(".", 1)[0]
+
+    @classmethod
+    def _get_mixin_key(cls, orig: str) -> str:
+        mixed = "".join(orig[i] for i in cls._MIXIN_KEY_ENC_TAB)
+        return mixed[:32]
+
+    async def _get_wbi_keys(self) -> tuple[str, str]:
+        if self._wbi_keys_cache is not None:
+            return self._wbi_keys_cache
+
+        nav = await self.get_login_info()
+        nav_data = nav.get("data", {}) if isinstance(nav, dict) else {}
+        wbi_img = nav_data.get("wbi_img", {}) if isinstance(nav_data, dict) else {}
+        img_url = str(wbi_img.get("img_url", "") or "")
+        sub_url = str(wbi_img.get("sub_url", "") or "")
+        if not img_url or not sub_url:
+            raise ValueError("无法从 nav 接口中获取 WBI keys")
+
+        img_key = self._extract_wbi_key(img_url)
+        sub_key = self._extract_wbi_key(sub_url)
+        self._wbi_keys_cache = (img_key, sub_key)
+        return self._wbi_keys_cache
+
+    async def _sign_wbi_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        img_key, sub_key = await self._get_wbi_keys()
+        mixin_key = self._get_mixin_key(img_key + sub_key)
+
+        signed = {k: v for k, v in params.items() if v is not None}
+        signed["wts"] = int(time.time())
+        signed = dict(sorted(signed.items()))
+        clean_signed: dict[str, Any] = {}
+        for key, value in signed.items():
+            text = str(value)
+            text = re.sub(r"[!'()*]", "", text)
+            clean_signed[key] = text
+
+        query = urlencode(clean_signed)
+        clean_signed["w_rid"] = md5((query + mixin_key).encode("utf-8")).hexdigest()
+        return clean_signed
 
     async def get_video_list(self, uid: str, page: int = 1, page_size: int = 5) -> dict[str, Any]:
         params = {
             "mid": uid,
-            "pn": page,
             "ps": page_size,
+            "pn": page,
+            "tid": 0,
+            "keyword": "",
             "order": "pubdate",
+            "platform": "web",
+            "web_location": 1550101,
+            "order_avoided": "true",
         }
-        return await self._request("GET", "https://api.bilibili.com/x/space/arc/search", params=params)
+        signed = await self._sign_wbi_params(params)
+        return await self._request("GET", "https://api.bilibili.com/x/space/wbi/arc/search", params=signed)
 
     async def get_video_comments(self, aid: str, page: int = 1, page_size: int = 20) -> dict[str, Any]:
         params = {
@@ -104,7 +171,7 @@ class BilibiliApiClient:
         return await self._request("GET", "https://api.bilibili.com/x/v2/reply", params=params)
 
 
-@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.2.0")
+@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.3.0")
 class BilibiliReplyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -125,7 +192,7 @@ class BilibiliReplyPlugin(Star):
             self.state_file.write_text(
                 json.dumps(
                     {
-                        "version": 2,
+                        "version": 3,
                         "notes": "基础版状态文件，后续用于保存运行状态、游标、缓存信息。",
                     },
                     ensure_ascii=False,
@@ -349,9 +416,12 @@ class BilibiliReplyPlugin(Star):
             uname = nav_data.get("uname", "未知")
             mid = nav_data.get("mid", "未知")
             is_login = nav_data.get("isLogin", False)
+            wbi_img = nav_data.get("wbi_img", {}) if isinstance(nav_data, dict) else {}
+            has_wbi = bool(wbi_img.get("img_url")) and bool(wbi_img.get("sub_url"))
 
             videos = await client.get_video_list(uid=uid, page=1, page_size=5)
             videos_code = videos.get("code")
+            videos_message = videos.get("message", "") if isinstance(videos, dict) else ""
             vlist = (
                 videos.get("data", {})
                 .get("list", {})
@@ -368,7 +438,9 @@ class BilibiliReplyPlugin(Star):
                 f"- uname: {uname}",
                 f"- mid: {mid}",
                 f"- csrf_present: {bool(client.csrf_token)}",
+                f"- has_wbi_keys: {has_wbi}",
                 f"- video_api.code: {videos_code}",
+                f"- video_api.message: {videos_message}",
                 f"- sample_video_count: {len(vlist)}",
             ]
             if sample_titles:
