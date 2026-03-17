@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from hashlib import md5
 from pathlib import Path
@@ -39,14 +40,6 @@ class BiliCommentPreview:
 
 
 class BilibiliApiClient:
-    """B站 API 最小客户端。
-
-    当前版本实现：
-    - 读取登录态
-    - 通过 WBI 读取视频列表
-    - 读取视频评论（只读）
-    """
-
     _MIXIN_KEY_ENC_TAB = [
         46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
         27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
@@ -114,7 +107,6 @@ class BilibiliApiClient:
     async def _get_wbi_keys(self) -> tuple[str, str]:
         if self._wbi_keys_cache is not None:
             return self._wbi_keys_cache
-
         nav = await self.get_login_info()
         nav_data = nav.get("data", {}) if isinstance(nav, dict) else {}
         wbi_img = nav_data.get("wbi_img", {}) if isinstance(nav_data, dict) else {}
@@ -122,7 +114,6 @@ class BilibiliApiClient:
         sub_url = str(wbi_img.get("sub_url", "") or "")
         if not img_url or not sub_url:
             raise ValueError("无法从 nav 接口中获取 WBI keys")
-
         img_key = self._extract_wbi_key(img_url)
         sub_key = self._extract_wbi_key(sub_url)
         self._wbi_keys_cache = (img_key, sub_key)
@@ -131,16 +122,13 @@ class BilibiliApiClient:
     async def _sign_wbi_params(self, params: dict[str, Any]) -> dict[str, Any]:
         img_key, sub_key = await self._get_wbi_keys()
         mixin_key = self._get_mixin_key(img_key + sub_key)
-
         signed = {k: v for k, v in params.items() if v is not None}
         signed["wts"] = int(time.time())
         signed = dict(sorted(signed.items()))
         clean_signed: dict[str, Any] = {}
         for key, value in signed.items():
-            text = str(value)
-            text = re.sub(r"[!'()*]", "", text)
+            text = re.sub(r"[!'()*]", "", str(value))
             clean_signed[key] = text
-
         query = urlencode(clean_signed)
         clean_signed["w_rid"] = md5((query + mixin_key).encode("utf-8")).hexdigest()
         return clean_signed
@@ -161,45 +149,91 @@ class BilibiliApiClient:
         return await self._request("GET", "https://api.bilibili.com/x/space/wbi/arc/search", params=signed)
 
     async def get_video_comments(self, aid: str, page: int = 1, page_size: int = 20) -> dict[str, Any]:
-        params = {
-            "type": 1,
-            "oid": aid,
-            "pn": page,
-            "ps": page_size,
-            "sort": 2,
-        }
+        params = {"type": 1, "oid": aid, "pn": page, "ps": page_size, "sort": 2}
         return await self._request("GET", "https://api.bilibili.com/x/v2/reply", params=params)
 
+    async def reply_to_comment(self, aid: str, comment_id: str, message: str) -> dict[str, Any]:
+        if not self.csrf_token:
+            raise ValueError("Cookie 中缺少 bili_jct，无法发送回复")
+        data = {
+            "type": 1,
+            "oid": aid,
+            "root": comment_id,
+            "parent": comment_id,
+            "message": message,
+            "csrf": self.csrf_token,
+        }
+        return await self._request("POST", "https://api.bilibili.com/x/v2/reply/add", data=data)
 
-@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.3.0")
+
+@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.4.0")
 class BilibiliReplyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or {}
         self.plugin_data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_bilibili"
         self.state_file = self.plugin_data_dir / "state.json"
+        self.processed_file = self.plugin_data_dir / "processed_comments.json"
+        self.history_file = self.plugin_data_dir / "reply_history.jsonl"
         self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
+        self.processed_comments: set[str] = set()
+        self._auto_task: asyncio.Task | None = None
+        self._cycle_lock = asyncio.Lock()
 
     async def initialize(self):
         await self._ensure_state_file()
+        self._load_processed_comments()
+        if self._enabled() and self._auto_poll_enabled():
+            self._start_auto_task()
         logger.info("astrbot_plugin_bilibili initialized")
 
     async def terminate(self):
+        await self._stop_auto_task()
+        self._save_processed_comments()
         logger.info("astrbot_plugin_bilibili terminated")
 
     async def _ensure_state_file(self):
         if not self.state_file.exists():
             self.state_file.write_text(
-                json.dumps(
-                    {
-                        "version": 3,
-                        "notes": "基础版状态文件，后续用于保存运行状态、游标、缓存信息。",
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                ),
+                json.dumps({"version": 4, "notes": "运行状态文件"}, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+        if not self.processed_file.exists():
+            self.processed_file.write_text("[]", encoding="utf-8")
+        if not self.history_file.exists():
+            self.history_file.write_text("", encoding="utf-8")
+
+    def _load_processed_comments(self):
+        try:
+            if self.processed_file.exists():
+                data = json.loads(self.processed_file.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self.processed_comments = {str(x) for x in data}
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"加载 processed_comments 失败: {e}")
+            self.processed_comments = set()
+
+    def _save_processed_comments(self):
+        try:
+            self.processed_file.write_text(
+                json.dumps(sorted(self.processed_comments), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"保存 processed_comments 失败: {e}")
+
+    def _append_history(self, item: dict[str, Any]):
+        try:
+            with self.history_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"写入回复历史失败: {e}")
+
+    def _enabled(self) -> bool:
+        return bool(self.config.get("enabled", True))
+
+    def _auto_poll_enabled(self) -> bool:
+        return bool(self.config.get("auto_poll", False))
 
     def _build_client(self) -> BilibiliApiClient:
         timeout = int(self.config.get("http_timeout_seconds", 20) or 20)
@@ -220,6 +254,15 @@ class BilibiliReplyPlugin(Star):
 
     def _scan_comment_page_limit(self) -> int:
         return int(self.config.get("scan_comment_page_limit", 2) or 2)
+
+    def _poll_interval_seconds(self) -> int:
+        return int(self.config.get("poll_interval_seconds", 120) or 120)
+
+    def _max_comments_per_cycle(self) -> int:
+        return int(self.config.get("max_comments_per_cycle", 5) or 5)
+
+    def _reply_delay_seconds(self) -> float:
+        return float(self.config.get("reply_delay_seconds", 2) or 2)
 
     @staticmethod
     def _is_mention(message: str, uname: str) -> bool:
@@ -280,13 +323,7 @@ class BilibiliReplyPlugin(Star):
         vlist: list[dict[str, Any]] = []
         for page in range(1, video_pages + 1):
             videos = await client.get_video_list(uid=uid, page=page, page_size=page_size)
-            page_vlist = (
-                videos.get("data", {})
-                .get("list", {})
-                .get("vlist", [])
-                if isinstance(videos, dict)
-                else []
-            )
+            page_vlist = videos.get("data", {}).get("list", {}).get("vlist", []) if isinstance(videos, dict) else []
             if not page_vlist:
                 break
             for video in page_vlist:
@@ -305,58 +342,29 @@ class BilibiliReplyPlugin(Star):
             title = str(video.get("title", "") or "")
             if not aid:
                 continue
-
             per_video_count = 0
             for page in range(1, self._scan_comment_page_limit() + 1):
-                comments = await client.get_video_comments(
-                    aid=aid,
-                    page=page,
-                    page_size=self._scan_comment_page_size(),
-                )
+                comments = await client.get_video_comments(aid=aid, page=page, page_size=self._scan_comment_page_size())
                 replies = comments.get("data", {}).get("replies", []) if isinstance(comments, dict) else []
                 if not replies:
                     break
                 for reply in replies or []:
                     if not isinstance(reply, dict):
                         continue
-                    preview = self._build_comment_preview(
-                        reply=reply,
-                        aid=aid,
-                        bvid=bvid,
-                        title=title,
-                        self_mid=self_mid,
-                        self_uname=self_uname,
-                    )
+                    preview = self._build_comment_preview(reply=reply, aid=aid, bvid=bvid, title=title, self_mid=self_mid, self_uname=self_uname)
                     if preview:
                         previews.append(preview)
                         per_video_count += 1
-
                     for sub_reply in (reply.get("replies", []) or []):
                         if not isinstance(sub_reply, dict):
                             continue
-                        sub_preview = self._build_comment_preview(
-                            reply=sub_reply,
-                            aid=aid,
-                            bvid=bvid,
-                            title=title,
-                            self_mid=self_mid,
-                            self_uname=self_uname,
-                        )
+                        sub_preview = self._build_comment_preview(reply=sub_reply, aid=aid, bvid=bvid, title=title, self_mid=self_mid, self_uname=self_uname)
                         if sub_preview:
                             previews.append(sub_preview)
                             per_video_count += 1
-
                 if len(replies) < self._scan_comment_page_size():
                     break
-
-            video_debug.append(
-                {
-                    "title": title,
-                    "bvid": bvid,
-                    "aid": aid,
-                    "comment_count": per_video_count,
-                }
-            )
+            video_debug.append({"title": title, "bvid": bvid, "aid": aid, "comment_count": per_video_count})
 
         meta = {
             "self_mid": self_mid,
@@ -368,22 +376,123 @@ class BilibiliReplyPlugin(Star):
         }
         return meta, previews
 
+    async def _generate_reply_text(self, comment: BiliCommentPreview) -> str:
+        provider_id = self._provider_id_from_config()
+        if not provider_id:
+            raise ValueError("未配置 provider_id")
+        system_prompt = str(self.config.get("persona_prompt", "") or "").strip()
+        max_chars = int(self.config.get("max_reply_chars", 80) or 80)
+        reply_prefix = str(self.config.get("reply_prefix", "") or "")
+        llm_resp = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=(
+                "请为下面这条B站评论生成一条自然、简短、像真人会说的话的回复。"
+                f"要求：不超过{max_chars}字，不要机械客服腔，不要自称AI。\n\n"
+                f"视频标题：{comment.video_title}\n"
+                f"评论用户：{comment.user_name}\n"
+                f"评论内容：{comment.message}"
+            ),
+            system_prompt=system_prompt,
+        )
+        text = (llm_resp.completion_text or "").strip()
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        return f"{reply_prefix}{text}".strip()
+
+    async def _process_one_cycle(self) -> dict[str, Any]:
+        async with self._cycle_lock:
+            meta, previews = await self._scan_recent_mentions()
+            candidates = [
+                item for item in previews
+                if item.mentioned and item.comment_id not in self.processed_comments
+            ]
+            max_count = self._max_comments_per_cycle()
+            dry_run = bool(self.config.get("dry_run", True))
+            processed_now: list[dict[str, Any]] = []
+            client = self._build_client()
+
+            for comment in candidates[:max_count]:
+                reply_text = await self._generate_reply_text(comment)
+                history = {
+                    "time": datetime.now().isoformat(),
+                    "dry_run": dry_run,
+                    "comment": asdict(comment),
+                    "reply_text": reply_text,
+                }
+                if dry_run:
+                    history["status"] = "dry_run"
+                    self._append_history(history)
+                    processed_now.append(history)
+                    continue
+
+                result = await client.reply_to_comment(aid=comment.aid, comment_id=comment.comment_id, message=reply_text)
+                history["api_result"] = result
+                if result.get("code") == 0:
+                    history["status"] = "replied"
+                    self.processed_comments.add(comment.comment_id)
+                    self._save_processed_comments()
+                else:
+                    history["status"] = "failed"
+                self._append_history(history)
+                processed_now.append(history)
+                await asyncio.sleep(self._reply_delay_seconds())
+
+            return {
+                "meta": meta,
+                "candidates": len(candidates),
+                "processed": processed_now,
+                "dry_run": dry_run,
+            }
+
+    def _start_auto_task(self):
+        if self._auto_task and not self._auto_task.done():
+            return
+        self._auto_task = asyncio.create_task(self._auto_poll_loop(), name="bili-auto-reply-loop")
+
+    async def _stop_auto_task(self):
+        if self._auto_task and not self._auto_task.done():
+            self._auto_task.cancel()
+            try:
+                await self._auto_task
+            except asyncio.CancelledError:
+                pass
+        self._auto_task = None
+
+    async def _auto_poll_loop(self):
+        while True:
+            try:
+                if self._enabled() and self._auto_poll_enabled():
+                    result = await self._process_one_cycle()
+                    logger.info(
+                        "bili auto cycle done: candidates=%s processed=%s dry_run=%s",
+                        result["candidates"],
+                        len(result["processed"]),
+                        result["dry_run"],
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                logger.exception(f"bili auto poll loop error: {e}")
+            await asyncio.sleep(self._poll_interval_seconds())
+
     def _base_status_text(self) -> str:
         uid = self._configured_uid()
         cookie = str(self.config.get("bilibili_cookie", "") or "").strip()
         provider_id = self._provider_id_from_config()
-        auto_poll = bool(self.config.get("auto_poll", False))
+        auto_poll = self._auto_poll_enabled()
         dry_run = bool(self.config.get("dry_run", True))
         only_at = bool(self.config.get("reply_only_when_mentioned", True))
         return (
             "B站回复插件状态\n"
-            f"- enabled: {bool(self.config.get('enabled', True))}\n"
+            f"- enabled: {self._enabled()}\n"
             f"- auto_poll: {auto_poll}\n"
+            f"- auto_task_running: {bool(self._auto_task and not self._auto_task.done())}\n"
             f"- dry_run: {dry_run}\n"
             f"- only_reply_when_mentioned: {only_at}\n"
             f"- bilibili_uid_configured: {bool(uid)}\n"
             f"- bilibili_cookie_configured: {bool(cookie)}\n"
             f"- provider_id_configured: {bool(provider_id)}\n"
+            f"- processed_comments: {len(self.processed_comments)}\n"
             f"- scan_video_limit: {self._scan_video_limit()}\n"
             f"- scan_comment_page_size: {self._scan_comment_page_size()}\n"
             f"- scan_comment_page_limit: {self._scan_comment_page_limit()}\n"
@@ -400,15 +509,12 @@ class BilibiliReplyPlugin(Star):
         """使用 B 站只读接口探测 Cookie / UID 是否可用。"""
         uid = self._configured_uid()
         client = self._build_client()
-
         if not client.is_configured():
             yield event.plain_result("未配置 bilibili_cookie，无法探测。")
             return
-
         if not uid:
             yield event.plain_result("未配置 bilibili_uid，无法探测视频列表。")
             return
-
         try:
             nav = await client.get_login_info()
             nav_code = nav.get("code")
@@ -418,19 +524,11 @@ class BilibiliReplyPlugin(Star):
             is_login = nav_data.get("isLogin", False)
             wbi_img = nav_data.get("wbi_img", {}) if isinstance(nav_data, dict) else {}
             has_wbi = bool(wbi_img.get("img_url")) and bool(wbi_img.get("sub_url"))
-
             videos = await client.get_video_list(uid=uid, page=1, page_size=5)
             videos_code = videos.get("code")
             videos_message = videos.get("message", "") if isinstance(videos, dict) else ""
-            vlist = (
-                videos.get("data", {})
-                .get("list", {})
-                .get("vlist", [])
-                if isinstance(videos, dict)
-                else []
-            )
+            vlist = videos.get("data", {}).get("list", {}).get("vlist", []) if isinstance(videos, dict) else []
             sample_titles = [item.get("title", "") for item in vlist[:3] if isinstance(item, dict)]
-
             lines = [
                 "B站探针结果",
                 f"- nav.code: {nav_code}",
@@ -446,7 +544,6 @@ class BilibiliReplyPlugin(Star):
             if sample_titles:
                 lines.append("- sample_titles:")
                 lines.extend([f"  - {title}" for title in sample_titles])
-
             yield event.plain_result("\n".join(lines))
         except httpx.HTTPStatusError as e:
             logger.exception("B站探针 HTTP 错误")
@@ -460,15 +557,10 @@ class BilibiliReplyPlugin(Star):
         """读取最近评论并标记是否命中 @我，仅做只读预览。"""
         try:
             meta, previews = await self._scan_recent_mentions()
-        except httpx.HTTPStatusError as e:
-            logger.exception("B站扫描 HTTP 错误")
-            yield event.plain_result(f"B站扫描失败：HTTP {e.response.status_code}")
-            return
         except Exception as e:  # noqa: BLE001
             logger.exception("B站扫描异常")
             yield event.plain_result(f"B站扫描失败：{e}")
             return
-
         matched = [item for item in previews if item.mentioned]
         lines = [
             "B站评论扫描结果",
@@ -481,15 +573,10 @@ class BilibiliReplyPlugin(Star):
             lines.append("- 当前扫描范围内没有读到评论。")
             yield event.plain_result("\n".join(lines))
             return
-
         lines.append("\n最近评论预览（最多 8 条）：")
         for item in previews[:8]:
             flag = "[命中@]" if item.mentioned else "[未命中]"
-            lines.append(
-                f"{flag} {item.user_name} | {item.video_title[:20]} | {item.time_text}\n"
-                f"{item.message[:120]}"
-            )
-
+            lines.append(f"{flag} {item.user_name} | {item.video_title[:20]} | {item.time_text}\n{item.message[:120]}")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("bili_scan_mentions")
@@ -497,15 +584,10 @@ class BilibiliReplyPlugin(Star):
         """仅展示命中 @我的评论。"""
         try:
             meta, previews = await self._scan_recent_mentions()
-        except httpx.HTTPStatusError as e:
-            logger.exception("B站扫描 HTTP 错误")
-            yield event.plain_result(f"B站扫描失败：HTTP {e.response.status_code}")
-            return
         except Exception as e:  # noqa: BLE001
             logger.exception("B站扫描异常")
             yield event.plain_result(f"B站扫描失败：{e}")
             return
-
         matched = [item for item in previews if item.mentioned]
         lines = [
             "B站 @我 命中结果",
@@ -517,15 +599,9 @@ class BilibiliReplyPlugin(Star):
             lines.append("- 当前扫描范围内没有发现 @你的评论。")
             yield event.plain_result("\n".join(lines))
             return
-
         lines.append("")
         for item in matched[:10]:
-            lines.append(
-                f"- {item.user_name} | {item.video_title[:24]} | {item.time_text}\n"
-                f"  comment_id={item.comment_id} bvid={item.bvid}\n"
-                f"  {item.message[:160]}"
-            )
-
+            lines.append(f"- {item.user_name} | {item.video_title[:24]} | {item.time_text}\n  comment_id={item.comment_id} bvid={item.bvid}\n  {item.message[:160]}")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("bili_scan_debug")
@@ -533,15 +609,10 @@ class BilibiliReplyPlugin(Star):
         """输出更详细的扫描调试信息。"""
         try:
             meta, previews = await self._scan_recent_mentions()
-        except httpx.HTTPStatusError as e:
-            logger.exception("B站扫描 HTTP 错误")
-            yield event.plain_result(f"B站扫描失败：HTTP {e.response.status_code}")
-            return
         except Exception as e:  # noqa: BLE001
             logger.exception("B站扫描异常")
             yield event.plain_result(f"B站扫描失败：{e}")
             return
-
         lines = [
             "B站扫描 Debug",
             f"- self_uname: {meta.get('self_uname') or '未知'}",
@@ -553,10 +624,7 @@ class BilibiliReplyPlugin(Star):
             "视频扫描明细：",
         ]
         for item in meta.get("video_debug", [])[:10]:
-            lines.append(
-                f"- {str(item.get('title', ''))[:30]} | bvid={item.get('bvid')} | comments={item.get('comment_count', 0)}"
-            )
-
+            lines.append(f"- {str(item.get('title', ''))[:30]} | bvid={item.get('bvid')} | comments={item.get('comment_count', 0)}")
         if previews:
             lines.append("")
             lines.append("评论样本（最多 10 条）：")
@@ -566,7 +634,31 @@ class BilibiliReplyPlugin(Star):
         else:
             lines.append("")
             lines.append("没有读到任何评论样本。")
+        yield event.plain_result("\n".join(lines))
 
+    @filter.command("bili_run_once")
+    async def bili_run_once(self, event: AstrMessageEvent):
+        """执行一轮自动回复流程。"""
+        try:
+            result = await self._process_one_cycle()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("bili_run_once 失败")
+            yield event.plain_result(f"执行失败：{e}")
+            return
+        lines = [
+            "B站自动回复执行结果",
+            f"- dry_run: {result['dry_run']}",
+            f"- matched_candidates: {result['candidates']}",
+            f"- handled_count: {len(result['processed'])}",
+        ]
+        for item in result["processed"][:5]:
+            comment = item.get("comment", {})
+            lines.append(
+                f"- {item.get('status')} | {comment.get('user_name')} | comment_id={comment.get('comment_id')}\n"
+                f"  reply={item.get('reply_text', '')[:160]}"
+            )
+        if not result["processed"]:
+            lines.append("- 本轮没有需要处理的新 @评论。")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("bili_dry_run")
@@ -576,25 +668,18 @@ class BilibiliReplyPlugin(Star):
         if not provider_id:
             yield event.plain_result("未配置 provider_id，无法执行 dry run。")
             return
-
         raw = event.message_str.strip()
         prompt_text = raw.replace("/bili_dry_run", "", 1).strip()
         if not prompt_text:
             yield event.plain_result("请在命令后带上测试评论文本，例如：/bili_dry_run 你好呀")
             return
-
         system_prompt = str(self.config.get("persona_prompt", "") or "").strip()
         max_chars = int(self.config.get("max_reply_chars", 80) or 80)
         reply_prefix = str(self.config.get("reply_prefix", "") or "")
-
         try:
             llm_resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
-                prompt=(
-                    "请把下面这条B站评论回复成自然、简短、像真人会说的话。"
-                    f"要求：不超过{max_chars}字。\n\n"
-                    f"评论：{prompt_text}"
-                ),
+                prompt=("请把下面这条B站评论回复成自然、简短、像真人会说的话。" f"要求：不超过{max_chars}字。\n\n" f"评论：{prompt_text}"),
                 system_prompt=system_prompt,
             )
             text = (llm_resp.completion_text or "").strip()

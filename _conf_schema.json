@@ -6,8 +6,9 @@
   },
   "auto_poll": {
     "type": "bool",
-    "description": "是否启用自动轮询（当前版本仅预留）",
-    "default": false
+    "description": "是否启用自动轮询自动回复",
+    "default": false,
+    "hint": "建议先手动执行 bili_run_once 验证，确认无误后再开启"
   },
   "poll_interval_seconds": {
     "type": "int",
@@ -36,7 +37,7 @@
   },
   "bilibili_refresh_token": {
     "type": "string",
-    "description": "B站 refresh_token（当前版本仅预留）",
+    "description": "B站 refresh_token（当前版本仍预留）",
     "default": "",
     "hint": "后续用于 Cookie 自动刷新"
   },
@@ -58,7 +59,12 @@
   "max_comments_per_cycle": {
     "type": "int",
     "description": "每轮最多处理的评论数",
-    "default": 5
+    "default": 3
+  },
+  "reply_delay_seconds": {
+    "type": "float",
+    "description": "每次成功发送回复后的延迟秒数",
+    "default": 2.0
   },
   "video_cache_ttl_seconds": {
     "type": "int",
@@ -67,17 +73,17 @@
   },
   "scan_video_limit": {
     "type": "int",
-    "description": "只读扫描时最多检查多少个最新视频",
+    "description": "扫描时最多检查多少个最新视频",
     "default": 10
   },
   "scan_comment_page_size": {
     "type": "int",
-    "description": "每个视频只读扫描多少条最新评论",
+    "description": "每个视频扫描多少条最新评论",
     "default": 20
   },
   "scan_comment_page_limit": {
     "type": "int",
-    "description": "每个视频最多扫描多少页评论（只读调试用）",
+    "description": "每个视频最多扫描多少页评论",
     "default": 2
   },
   "http_timeout_seconds": {
@@ -87,9 +93,9 @@
   },
   "dry_run": {
     "type": "bool",
-    "description": "是否启用演练模式（后续自动回复时不真正发送）",
+    "description": "是否启用演练模式（开启时只生成不发送）",
     "default": true,
-    "hint": "建议开发和首轮联调时保持开启"
+    "hint": "第一次联调建议保持 true，确认回复文本和命中范围正确后再关闭"
   },
   "persona_prompt": {
     "type": "text",

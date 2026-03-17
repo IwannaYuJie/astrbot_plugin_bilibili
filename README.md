@@ -2,79 +2,102 @@
 
 基于 AstrBot 的 B 站评论区自动回复插件。
 
-> 当前仓库为 **第一阶段基础版**：先完成方案文档、配置设计和最小插件骨架，方便后续按文档逐步开发成可上线版本。
+> 当前仓库已具备：登录探针、WBI 视频列表读取、评论扫描、`@你` 命中识别、自动生成回复、手动执行一轮自动回复、可选后台自动轮询回复。
 
 ## 当前已完成
 
 - 完整的方案设计文档
 - AstrBot 插件基础骨架
 - 插件配置 Schema
-- 基础命令：状态检查、Cookie/UID连通性验证、评论只读扫描、LLM 回复 Dry Run
-- 插件数据目录初始化
-
-## 目标能力（后续迭代）
-
-- 定时轮询 UP 主自己视频的最新评论
-- 仅在评论命中 `@我` / 关键词 / 指定规则时触发回复
-- 调用 AstrBot 已配置的大模型生成回复
-- 自动回发 B 站评论
-- 去重、限流、日志、失败重试、人工审核开关
-
-## 仓库结构
-
-- `docs/design.md`：完整设计文档
-- `docs/development-plan.md`：分阶段开发计划
-- `main.py`：最小可运行插件骨架
-- `_conf_schema.json`：AstrBot WebUI 配置定义
-- `metadata.yaml`：插件元信息
-- `requirements.txt`：插件依赖
+- B站登录态探针
+- WBI 视频列表读取
+- 评论只读扫描与 `@你` 命中识别
+- 基于 AstrBot LLM 的自动回复生成
+- 单轮自动回复执行
+- 已处理评论去重持久化
+- 可选后台轮询自动回复
 
 ## 当前基础命令
 
-加载插件后，可先使用以下命令验证环境：
-
 - `/bili_status`
-  - 查看当前插件配置、运行状态、必要字段是否已填写
+  - 查看当前插件配置、运行状态、是否开启自动轮询、已处理评论数
 - `/bili_probe`
-  - 使用当前 Cookie 调 B 站只读接口，检查登录状态和 UID 配置是否可用
+  - 探测登录态、WBI keys、视频列表接口是否正常
 - `/bili_scan`
-  - 扫描最近几条评论，预览哪些评论命中了 `@你`
+  - 扫描最近几条评论，预览评论与 `@你` 命中情况
 - `/bili_scan_mentions`
   - 仅显示命中 `@你` 的评论
 - `/bili_scan_debug`
-  - 输出视频扫描明细与评论样本，方便定位“到底有没有读到评论”
+  - 输出视频扫描明细与评论样本，方便排障
 - `/bili_dry_run 你好，测试一下人设回复`
   - 直接调用 AstrBot 当前配置的大模型，验证人设 Prompt 和回复链路
+- `/bili_run_once`
+  - 立即执行一轮自动回复流程；如果 `dry_run=true` 则只生成不发送
 
-## 需要提前准备
+## 最关键配置
 
-### 必需
+### 必填
 
-1. B 站登录 Cookie
+1. `bilibili_cookie`
    - 至少包含 `SESSDATA`
-   - 必须包含 `bili_jct`
-2. B 站 UP 主 UID
-3. AstrBot 中已经可用的聊天模型 Provider
-4. 云服务器上的 AstrBot 运行环境
+   - 回复时必须包含 `bili_jct`
+2. `bilibili_uid`
+3. `provider_id`
 
-### 强烈建议
+### 自动回复前建议确认
 
-5. `refresh_token`
-6. 一个稳定的人设 Prompt
-7. 明确的触发规则（先建议只回复 `@你`）
-8. 合理的轮询间隔和频率限制
+4. `dry_run=true`
+5. 先用 `/bili_scan_mentions` 看命中范围
+6. 再用 `/bili_run_once` 观察生成结果
+7. 确认无误后再把 `dry_run=false`
+8. 最后视情况开启 `auto_poll=true`
 
-## 开发建议
+## 自动回复推荐上线顺序
 
-第一版建议按下面顺序落地：
+### 第一步：验证命中范围
+- `/bili_probe`
+- `/bili_scan_debug`
+- `/bili_scan_mentions`
 
-1. 文档与配置结构
-2. 只读探针能力（Cookie/UID/视频列表）
-3. 评论只读扫描（@命中识别）
-4. LLM Dry Run
-5. 手动触发回复
-6. 定时自动轮询
-7. 限流 / 去重 / 日志 / 审核
+### 第二步：演练回复
+- 保持 `dry_run=true`
+- 执行 `/bili_run_once`
+- 查看插件回复历史和控制台日志
+
+### 第三步：真实发送
+- 改为 `dry_run=false`
+- 再执行 `/bili_run_once`
+
+### 第四步：后台自动轮询
+- 开启 `auto_poll=true`
+- 配置合适的 `poll_interval_seconds`
+- 建议一开始 `max_comments_per_cycle=1~3`
+
+## 数据文件
+
+插件会在：
+
+- `data/plugin_data/astrbot_plugin_bilibili/`
+
+下生成：
+
+- `processed_comments.json`：已处理评论 ID
+- `reply_history.jsonl`：回复历史
+- `state.json`：运行状态文件
+
+## 风险提醒
+
+- 本插件依赖 B站网页侧接口，存在风控、接口变动、Cookie 失效风险
+- 建议默认只回复 `@你` 的评论
+- 建议先 `dry_run`，确认命中和文案正确后再发真实评论
+- 建议不要把轮询间隔设太短
+
+## 当前仍未完成
+
+- Cookie 自动刷新
+- 更完善的敏感词过滤
+- 审核模式
+- 黑白名单
 
 ## 参考文档
 
@@ -83,7 +106,3 @@
 - 插件配置：<https://docs.astrbot.app/dev/star/guides/plugin-config.html>
 - 调用 AI：<https://docs.astrbot.app/dev/star/guides/ai.html>
 - 插件存储：<https://docs.astrbot.app/dev/star/guides/storage.html>
-
-## 说明
-
-本项目当前版本还 **没有启用自动回复与定时轮询**，但已经支持 WBI 视频列表读取、评论只读扫描与 `@你` 命中预览，后续将按设计文档逐步补全。
