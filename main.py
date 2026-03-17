@@ -74,9 +74,9 @@ class BilibiliApiClient:
 
 @register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.1.0")
 class BilibiliReplyPlugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
-        self.config = config
+        self.config = config or {}
         self.plugin_data_dir = get_astrbot_data_path() / "plugin_data" / "astrbot_plugin_bilibili"
         self.state_file = self.plugin_data_dir / "state.json"
         self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
