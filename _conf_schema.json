@@ -1,0 +1,86 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用插件逻辑",
+    "default": true
+  },
+  "auto_poll": {
+    "type": "bool",
+    "description": "是否启用自动轮询（当前版本仅预留）",
+    "default": false
+  },
+  "poll_interval_seconds": {
+    "type": "int",
+    "description": "轮询间隔秒数",
+    "default": 120,
+    "hint": "建议一开始设置为 120 秒或更长，降低风控风险"
+  },
+  "provider_id": {
+    "type": "string",
+    "description": "用于后台生成回复的聊天模型 Provider ID",
+    "default": "",
+    "_special": "select_provider",
+    "hint": "建议显式指定，而不是依赖当前会话模型"
+  },
+  "bilibili_uid": {
+    "type": "string",
+    "description": "B站 UP 主 UID",
+    "default": ""
+  },
+  "bilibili_cookie": {
+    "type": "text",
+    "description": "B站登录 Cookie",
+    "default": "",
+    "hint": "至少应包含 SESSDATA，回复时必须包含 bili_jct",
+    "obvious_hint": true
+  },
+  "bilibili_refresh_token": {
+    "type": "string",
+    "description": "B站 refresh_token（当前版本仅预留）",
+    "default": "",
+    "hint": "后续用于 Cookie 自动刷新"
+  },
+  "reply_only_when_mentioned": {
+    "type": "bool",
+    "description": "是否仅在评论 @我 时回复",
+    "default": true
+  },
+  "reply_prefix": {
+    "type": "string",
+    "description": "回复前缀",
+    "default": ""
+  },
+  "max_reply_chars": {
+    "type": "int",
+    "description": "回复最大字符数",
+    "default": 80
+  },
+  "max_comments_per_cycle": {
+    "type": "int",
+    "description": "每轮最多处理的评论数",
+    "default": 5
+  },
+  "video_cache_ttl_seconds": {
+    "type": "int",
+    "description": "视频列表缓存时间（秒）",
+    "default": 21600
+  },
+  "http_timeout_seconds": {
+    "type": "int",
+    "description": "HTTP 请求超时（秒）",
+    "default": 20
+  },
+  "dry_run": {
+    "type": "bool",
+    "description": "是否启用演练模式（后续自动回复时不真正发送）",
+    "default": true,
+    "hint": "建议开发和首轮联调时保持开启"
+  },
+  "persona_prompt": {
+    "type": "text",
+    "description": "回复人格提示词",
+    "default": "你是一个活跃在B站评论区、语气自然友好的UP主分身。请基于当前评论内容生成简短、自然、像真人说的话的回复。不要自称AI，不要机械客服腔，控制在80字以内。",
+    "editor_mode": true,
+    "editor_language": "markdown"
+  }
+}
