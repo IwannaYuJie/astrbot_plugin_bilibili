@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,14 +13,33 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
-class BilibiliApiClient:
-    """B站 API 的最小只读客户端。
+@dataclass
+class BiliCommentPreview:
+    comment_id: str
+    aid: str
+    bvid: str
+    video_title: str
+    user_name: str
+    user_mid: str
+    message: str
+    ctime: int
+    mentioned: bool
 
-    当前版本只实现：
+    @property
+    def time_text(self) -> str:
+        try:
+            return datetime.fromtimestamp(self.ctime).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(self.ctime)
+
+
+class BilibiliApiClient:
+    """B站 API 的最小客户端。
+
+    当前版本实现：
     - 读取登录态
     - 读取视频列表
-
-    后续版本再补充评论拉取、发送回复、Cookie 刷新等能力。
+    - 读取视频评论（只读）
     """
 
     def __init__(self, cookie: str, timeout: int = 20):
@@ -71,8 +92,18 @@ class BilibiliApiClient:
         }
         return await self._request("GET", "https://api.bilibili.com/x/space/arc/search", params=params)
 
+    async def get_video_comments(self, aid: str, page: int = 1, page_size: int = 20) -> dict[str, Any]:
+        params = {
+            "type": 1,
+            "oid": aid,
+            "pn": page,
+            "ps": page_size,
+            "sort": 2,
+        }
+        return await self._request("GET", "https://api.bilibili.com/x/v2/reply", params=params)
 
-@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.1.0")
+
+@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.2.0")
 class BilibiliReplyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -93,7 +124,7 @@ class BilibiliReplyPlugin(Star):
             self.state_file.write_text(
                 json.dumps(
                     {
-                        "version": 1,
+                        "version": 2,
                         "notes": "基础版状态文件，后续用于保存运行状态、游标、缓存信息。",
                     },
                     ensure_ascii=False,
@@ -110,8 +141,103 @@ class BilibiliReplyPlugin(Star):
     def _provider_id_from_config(self) -> str:
         return str(self.config.get("provider_id", "") or "").strip()
 
+    def _configured_uid(self) -> str:
+        return str(self.config.get("bilibili_uid", "") or "").strip()
+
+    def _scan_video_limit(self) -> int:
+        return int(self.config.get("scan_video_limit", 3) or 3)
+
+    def _scan_comment_page_size(self) -> int:
+        return int(self.config.get("scan_comment_page_size", 10) or 10)
+
+    @staticmethod
+    def _is_mention(message: str, uname: str) -> bool:
+        text = (message or "").strip()
+        target = (uname or "").strip()
+        if not text or not target:
+            return False
+        return f"@{target}" in text or f"＠{target}" in text
+
+    async def _scan_recent_mentions(self) -> tuple[dict[str, Any], list[BiliCommentPreview]]:
+        uid = self._configured_uid()
+        client = self._build_client()
+        if not client.is_configured():
+            raise ValueError("未配置 bilibili_cookie")
+        if not uid:
+            raise ValueError("未配置 bilibili_uid")
+
+        nav = await client.get_login_info()
+        nav_data = nav.get("data", {}) if isinstance(nav, dict) else {}
+        self_mid = str(nav_data.get("mid", "") or "")
+        self_uname = str(nav_data.get("uname", "") or "").strip()
+
+        videos = await client.get_video_list(
+            uid=uid,
+            page=1,
+            page_size=self._scan_video_limit(),
+        )
+        vlist = (
+            videos.get("data", {})
+            .get("list", {})
+            .get("vlist", [])
+            if isinstance(videos, dict)
+            else []
+        )
+
+        previews: list[BiliCommentPreview] = []
+        for video in vlist:
+            if not isinstance(video, dict):
+                continue
+            aid = str(video.get("aid", "") or "")
+            bvid = str(video.get("bvid", "") or "")
+            title = str(video.get("title", "") or "")
+            if not aid:
+                continue
+
+            comments = await client.get_video_comments(
+                aid=aid,
+                page=1,
+                page_size=self._scan_comment_page_size(),
+            )
+            replies = comments.get("data", {}).get("replies", []) if isinstance(comments, dict) else []
+            for reply in replies or []:
+                if not isinstance(reply, dict):
+                    continue
+                member = reply.get("member", {}) or {}
+                content = reply.get("content", {}) or {}
+                user_mid = str(member.get("mid", "") or "")
+                user_name = str(member.get("uname", "") or "")
+                message = str(content.get("message", "") or "").strip()
+                if not message:
+                    continue
+                if self_mid and user_mid == self_mid:
+                    continue
+                mentioned = self._is_mention(message, self_uname)
+                previews.append(
+                    BiliCommentPreview(
+                        comment_id=str(reply.get("rpid", "") or ""),
+                        aid=aid,
+                        bvid=bvid,
+                        video_title=title,
+                        user_name=user_name,
+                        user_mid=user_mid,
+                        message=message,
+                        ctime=int(reply.get("ctime", 0) or 0),
+                        mentioned=mentioned,
+                    )
+                )
+
+        meta = {
+            "self_mid": self_mid,
+            "self_uname": self_uname,
+            "video_count": len(vlist),
+            "comment_count": len(previews),
+            "mention_count": len([item for item in previews if item.mentioned]),
+        }
+        return meta, previews
+
     def _base_status_text(self) -> str:
-        uid = str(self.config.get("bilibili_uid", "") or "").strip()
+        uid = self._configured_uid()
         cookie = str(self.config.get("bilibili_cookie", "") or "").strip()
         provider_id = self._provider_id_from_config()
         auto_poll = bool(self.config.get("auto_poll", False))
@@ -126,6 +252,8 @@ class BilibiliReplyPlugin(Star):
             f"- bilibili_uid_configured: {bool(uid)}\n"
             f"- bilibili_cookie_configured: {bool(cookie)}\n"
             f"- provider_id_configured: {bool(provider_id)}\n"
+            f"- scan_video_limit: {self._scan_video_limit()}\n"
+            f"- scan_comment_page_size: {self._scan_comment_page_size()}\n"
             f"- plugin_data_dir: {self.plugin_data_dir}"
         )
 
@@ -137,7 +265,7 @@ class BilibiliReplyPlugin(Star):
     @filter.command("bili_probe")
     async def bili_probe(self, event: AstrMessageEvent):
         """使用 B 站只读接口探测 Cookie / UID 是否可用。"""
-        uid = str(self.config.get("bilibili_uid", "") or "").strip()
+        uid = self._configured_uid()
         client = self._build_client()
 
         if not client.is_configured():
@@ -188,6 +316,79 @@ class BilibiliReplyPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.exception("B站探针异常")
             yield event.plain_result(f"B站探针失败：{e}")
+
+    @filter.command("bili_scan")
+    async def bili_scan(self, event: AstrMessageEvent):
+        """读取最近评论并标记是否命中 @我，仅做只读预览。"""
+        try:
+            meta, previews = await self._scan_recent_mentions()
+        except httpx.HTTPStatusError as e:
+            logger.exception("B站扫描 HTTP 错误")
+            yield event.plain_result(f"B站扫描失败：HTTP {e.response.status_code}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("B站扫描异常")
+            yield event.plain_result(f"B站扫描失败：{e}")
+            return
+
+        matched = [item for item in previews if item.mentioned]
+        lines = [
+            "B站评论扫描结果",
+            f"- self_uname: {meta.get('self_uname') or '未知'}",
+            f"- scanned_videos: {meta.get('video_count', 0)}",
+            f"- scanned_comments: {meta.get('comment_count', 0)}",
+            f"- matched_mentions: {len(matched)}",
+        ]
+        if not previews:
+            lines.append("- 当前扫描范围内没有读到评论。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        lines.append("\n最近评论预览（最多 8 条）：")
+        for item in previews[:8]:
+            flag = "[命中@]" if item.mentioned else "[未命中]"
+            lines.append(
+                f"{flag} {item.user_name} | {item.video_title[:20]} | {item.time_text}\n"
+                f"{item.message[:120]}"
+            )
+
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("bili_scan_mentions")
+    async def bili_scan_mentions(self, event: AstrMessageEvent):
+        """仅展示命中 @我的评论。"""
+        try:
+            meta, previews = await self._scan_recent_mentions()
+        except httpx.HTTPStatusError as e:
+            logger.exception("B站扫描 HTTP 错误")
+            yield event.plain_result(f"B站扫描失败：HTTP {e.response.status_code}")
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("B站扫描异常")
+            yield event.plain_result(f"B站扫描失败：{e}")
+            return
+
+        matched = [item for item in previews if item.mentioned]
+        lines = [
+            "B站 @我 命中结果",
+            f"- self_uname: {meta.get('self_uname') or '未知'}",
+            f"- scanned_videos: {meta.get('video_count', 0)}",
+            f"- matched_mentions: {len(matched)}",
+        ]
+        if not matched:
+            lines.append("- 当前扫描范围内没有发现 @你的评论。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        lines.append("")
+        for item in matched[:10]:
+            lines.append(
+                f"- {item.user_name} | {item.video_title[:24]} | {item.time_text}\n"
+                f"  comment_id={item.comment_id} bvid={item.bvid}\n"
+                f"  {item.message[:160]}"
+            )
+
+        yield event.plain_result("\n".join(lines))
 
     @filter.command("bili_dry_run")
     async def bili_dry_run(self, event: AstrMessageEvent):

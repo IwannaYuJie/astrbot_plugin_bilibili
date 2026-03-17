@@ -65,6 +65,16 @@
     "description": "视频列表缓存时间（秒）",
     "default": 21600
   },
+  "scan_video_limit": {
+    "type": "int",
+    "description": "只读扫描时最多检查多少个最新视频",
+    "default": 3
+  },
+  "scan_comment_page_size": {
+    "type": "int",
+    "description": "每个视频只读扫描多少条最新评论",
+    "default": 10
+  },
   "http_timeout_seconds": {
     "type": "int",
     "description": "HTTP 请求超时（秒）",
