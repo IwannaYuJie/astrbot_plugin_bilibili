@@ -19,6 +19,30 @@ from astrbot.api.star import Context, Star, register
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 
+
+
+@dataclass
+class BiliMessageTrigger:
+    msg_id: str
+    msg_kind: str
+    user_name: str
+    user_mid: str
+    oid: str
+    root_id: str
+    parent_id: str
+    source_content: str
+    title: str
+    ctime: int
+    business: str
+
+    @property
+    def time_text(self) -> str:
+        try:
+            return datetime.fromtimestamp(self.ctime).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return str(self.ctime)
+
+
 @dataclass
 class BiliCommentPreview:
     comment_id: str
@@ -152,14 +176,22 @@ class BilibiliApiClient:
         params = {"type": 1, "oid": aid, "pn": page, "ps": page_size, "sort": 2}
         return await self._request("GET", "https://api.bilibili.com/x/v2/reply", params=params)
 
-    async def reply_to_comment(self, aid: str, comment_id: str, message: str) -> dict[str, Any]:
+    async def get_msg_feed_at(self) -> dict[str, Any]:
+        params = {"platform": "web", "build": 0, "mobi_app": "web", "web_location": 333.40164}
+        return await self._request("GET", "https://api.bilibili.com/x/msgfeed/at", params=params)
+
+    async def get_msg_feed_reply(self) -> dict[str, Any]:
+        params = {"platform": "web", "build": 0, "mobi_app": "web", "web_location": 333.40164}
+        return await self._request("GET", "https://api.bilibili.com/x/msgfeed/reply", params=params)
+
+    async def reply_to_comment(self, aid: str, root_id: str, parent_id: str, message: str) -> dict[str, Any]:
         if not self.csrf_token:
             raise ValueError("Cookie 中缺少 bili_jct，无法发送回复")
         data = {
             "type": 1,
             "oid": aid,
-            "root": comment_id,
-            "parent": comment_id,
+            "root": root_id,
+            "parent": parent_id,
             "message": message,
             "csrf": self.csrf_token,
         }
@@ -174,9 +206,11 @@ class BilibiliReplyPlugin(Star):
         self.plugin_data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_bilibili"
         self.state_file = self.plugin_data_dir / "state.json"
         self.processed_file = self.plugin_data_dir / "processed_comments.json"
+        self.processed_msg_file = self.plugin_data_dir / "processed_messages.json"
         self.history_file = self.plugin_data_dir / "reply_history.jsonl"
         self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
         self.processed_comments: set[str] = set()
+        self.processed_messages: set[str] = set()
         self._auto_task: asyncio.Task | None = None
         self._cycle_lock = asyncio.Lock()
 
@@ -200,6 +234,8 @@ class BilibiliReplyPlugin(Star):
             )
         if not self.processed_file.exists():
             self.processed_file.write_text("[]", encoding="utf-8")
+        if not self.processed_msg_file.exists():
+            self.processed_msg_file.write_text("[]", encoding="utf-8")
         if not self.history_file.exists():
             self.history_file.write_text("", encoding="utf-8")
 
@@ -212,6 +248,14 @@ class BilibiliReplyPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"加载 processed_comments 失败: {e}")
             self.processed_comments = set()
+        try:
+            if self.processed_msg_file.exists():
+                data = json.loads(self.processed_msg_file.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    self.processed_messages = {str(x) for x in data}
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"加载 processed_messages 失败: {e}")
+            self.processed_messages = set()
 
     def _save_processed_comments(self):
         try:
@@ -221,6 +265,13 @@ class BilibiliReplyPlugin(Star):
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"保存 processed_comments 失败: {e}")
+        try:
+            self.processed_msg_file.write_text(
+                json.dumps(sorted(self.processed_messages), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"保存 processed_messages 失败: {e}")
 
     def _append_history(self, item: dict[str, Any]):
         try:
@@ -376,6 +427,82 @@ class BilibiliReplyPlugin(Star):
         }
         return meta, previews
 
+    async def _scan_message_triggers(self) -> tuple[dict[str, Any], list[BiliMessageTrigger]]:
+        client = self._build_client()
+        if not client.is_configured():
+            raise ValueError("未配置 bilibili_cookie")
+
+        at_data = await client.get_msg_feed_at()
+        reply_data = await client.get_msg_feed_reply()
+
+        triggers: list[BiliMessageTrigger] = []
+
+        def _append_items(raw: dict[str, Any], kind: str):
+            data = raw.get("data", {}) if isinstance(raw, dict) else {}
+            items = data.get("items", []) if isinstance(data, dict) else []
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                user = item.get("user", {}) or {}
+                content = item.get("item", {}) or {}
+                msg_id = str(item.get("id", "") or "")
+                oid = str(content.get("subject_id", "") or content.get("business_id", "") or "")
+                root_id = str(content.get("root_id", "") or content.get("source_id", "") or "")
+                parent_id = str(content.get("source_id", "") or content.get("target_id", "") or root_id)
+                source_content = str(content.get("source_content", "") or content.get("message", "") or content.get("target_reply_content", "") or "").strip()
+                title = str(content.get("title", "") or content.get("detail_title", "") or "")
+                ctime = int(item.get("at_time", 0) or item.get("reply_time", 0) or 0)
+                business = str(content.get("business", "") or "")
+                if not msg_id or not oid or not root_id:
+                    continue
+                triggers.append(BiliMessageTrigger(
+                    msg_id=msg_id,
+                    msg_kind=kind,
+                    user_name=str(user.get("nickname", "") or ""),
+                    user_mid=str(user.get("mid", "") or ""),
+                    oid=oid,
+                    root_id=root_id,
+                    parent_id=parent_id,
+                    source_content=source_content,
+                    title=title,
+                    ctime=ctime,
+                    business=business,
+                ))
+
+        _append_items(at_data, "at")
+        _append_items(reply_data, "reply")
+        triggers.sort(key=lambda x: x.ctime, reverse=True)
+        meta = {
+            "at_count": len((at_data.get("data", {}) or {}).get("items", []) if isinstance(at_data, dict) else []),
+            "reply_count": len((reply_data.get("data", {}) or {}).get("items", []) if isinstance(reply_data, dict) else []),
+            "trigger_count": len(triggers),
+        }
+        return meta, triggers
+
+    async def _generate_reply_for_trigger(self, trigger: BiliMessageTrigger) -> str:
+        provider_id = self._provider_id_from_config()
+        if not provider_id:
+            raise ValueError("未配置 provider_id")
+        system_prompt = str(self.config.get("persona_prompt", "") or "").strip()
+        max_chars = int(self.config.get("max_reply_chars", 80) or 80)
+        reply_prefix = str(self.config.get("reply_prefix", "") or "")
+        llm_resp = await self.context.llm_generate(
+            chat_provider_id=provider_id,
+            prompt=(
+                "下面是一条来自B站消息中心的新互动，请基于具体评论内容生成一条自然、简短、像真人会说的话的回复。"
+                f"要求：不超过{max_chars}字，不要机械客服腔，不要自称AI。\n\n"
+                f"消息类型：{trigger.msg_kind}\n"
+                f"视频标题：{trigger.title}\n"
+                f"对方用户：{trigger.user_name}\n"
+                f"评论内容：{trigger.source_content}"
+            ),
+            system_prompt=system_prompt,
+        )
+        text = (llm_resp.completion_text or "").strip()
+        if len(text) > max_chars:
+            text = text[:max_chars]
+        return f"{reply_prefix}{text}".strip()
+
     async def _generate_reply_text(self, comment: BiliCommentPreview) -> str:
         provider_id = self._provider_id_from_config()
         if not provider_id:
@@ -401,22 +528,19 @@ class BilibiliReplyPlugin(Star):
 
     async def _process_one_cycle(self) -> dict[str, Any]:
         async with self._cycle_lock:
-            meta, previews = await self._scan_recent_mentions()
-            candidates = [
-                item for item in previews
-                if item.mentioned and item.comment_id not in self.processed_comments
-            ]
+            meta, triggers = await self._scan_message_triggers()
+            candidates = [item for item in triggers if item.msg_id not in self.processed_messages]
             max_count = self._max_comments_per_cycle()
             dry_run = bool(self.config.get("dry_run", True))
             processed_now: list[dict[str, Any]] = []
             client = self._build_client()
 
-            for comment in candidates[:max_count]:
-                reply_text = await self._generate_reply_text(comment)
+            for trigger in candidates[:max_count]:
+                reply_text = await self._generate_reply_for_trigger(trigger)
                 history = {
                     "time": datetime.now().isoformat(),
                     "dry_run": dry_run,
-                    "comment": asdict(comment),
+                    "trigger": asdict(trigger),
                     "reply_text": reply_text,
                 }
                 if dry_run:
@@ -425,11 +549,18 @@ class BilibiliReplyPlugin(Star):
                     processed_now.append(history)
                     continue
 
-                result = await client.reply_to_comment(aid=comment.aid, comment_id=comment.comment_id, message=reply_text)
+                result = await client.reply_to_comment(
+                    aid=trigger.oid,
+                    root_id=trigger.root_id,
+                    parent_id=trigger.parent_id or trigger.root_id,
+                    message=reply_text,
+                )
                 history["api_result"] = result
                 if result.get("code") == 0:
                     history["status"] = "replied"
-                    self.processed_comments.add(comment.comment_id)
+                    self.processed_messages.add(trigger.msg_id)
+                    if trigger.parent_id:
+                        self.processed_comments.add(trigger.parent_id)
                     self._save_processed_comments()
                 else:
                     history["status"] = "failed"
@@ -493,6 +624,7 @@ class BilibiliReplyPlugin(Star):
             f"- bilibili_cookie_configured: {bool(cookie)}\n"
             f"- provider_id_configured: {bool(provider_id)}\n"
             f"- processed_comments: {len(self.processed_comments)}\n"
+            f"- processed_messages: {len(self.processed_messages)}\n"
             f"- scan_video_limit: {self._scan_video_limit()}\n"
             f"- scan_comment_page_size: {self._scan_comment_page_size()}\n"
             f"- scan_comment_page_limit: {self._scan_comment_page_limit()}\n"
@@ -636,6 +768,33 @@ class BilibiliReplyPlugin(Star):
             lines.append("没有读到任何评论样本。")
         yield event.plain_result("\n".join(lines))
 
+    @filter.command("bili_msg_debug")
+    async def bili_msg_debug(self, event: AstrMessageEvent):
+        """查看消息中心触发源调试信息。"""
+        try:
+            meta, triggers = await self._scan_message_triggers()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("消息中心扫描异常")
+            yield event.plain_result(f"消息中心扫描失败：{e}")
+            return
+        lines = [
+            "B站消息中心 Debug",
+            f"- at_items: {meta.get('at_count', 0)}",
+            f"- reply_items: {meta.get('reply_count', 0)}",
+            f"- usable_triggers: {meta.get('trigger_count', 0)}",
+        ]
+        if not triggers:
+            lines.append("- 当前消息中心里没有可用于回复的新触发项。")
+        else:
+            lines.append("")
+            for item in triggers[:10]:
+                lines.append(
+                    f"- [{item.msg_kind}] {item.user_name} | msg_id={item.msg_id} | oid={item.oid} | root={item.root_id} | parent={item.parent_id}\n"
+                    f"  title={item.title[:30]}\n"
+                    f"  content={item.source_content[:120]}"
+                )
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("bili_run_once")
     async def bili_run_once(self, event: AstrMessageEvent):
         """执行一轮自动回复流程。"""
@@ -652,9 +811,9 @@ class BilibiliReplyPlugin(Star):
             f"- handled_count: {len(result['processed'])}",
         ]
         for item in result["processed"][:5]:
-            comment = item.get("comment", {})
+            trigger = item.get("trigger", {})
             lines.append(
-                f"- {item.get('status')} | {comment.get('user_name')} | comment_id={comment.get('comment_id')}\n"
+                f"- {item.get('status')} | {trigger.get('user_name')} | msg_id={trigger.get('msg_id')} | oid={trigger.get('oid')}\n"
                 f"  reply={item.get('reply_text', '')[:160]}"
             )
         if not result["processed"]:

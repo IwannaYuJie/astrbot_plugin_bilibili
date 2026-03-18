@@ -14,7 +14,8 @@
 - 评论只读扫描与 `@你` 命中识别
 - 基于 AstrBot LLM 的自动回复生成
 - 单轮自动回复执行
-- 已处理评论去重持久化
+- 消息中心触发源（@我 / 回复我）
+- 已处理评论与消息去重持久化
 - 可选后台轮询自动回复
 
 ## 当前基础命令
@@ -31,8 +32,10 @@
   - 输出视频扫描明细与评论样本，方便排障
 - `/bili_dry_run 你好，测试一下人设回复`
   - 直接调用 AstrBot 当前配置的大模型，验证人设 Prompt 和回复链路
+- `/bili_msg_debug`
+  - 查看消息中心里的可用触发项（@我 / 回复我）及其关键字段
 - `/bili_run_once`
-  - 立即执行一轮自动回复流程；如果 `dry_run=true` 则只生成不发送
+  - 基于消息中心触发源立即执行一轮自动回复流程；如果 `dry_run=true` 则只生成不发送
 
 ## 最关键配置
 
@@ -47,7 +50,7 @@
 ### 自动回复前建议确认
 
 4. `dry_run=true`
-5. 先用 `/bili_scan_mentions` 看命中范围
+5. 先用 `/bili_msg_debug` 看消息中心触发范围
 6. 再用 `/bili_run_once` 观察生成结果
 7. 确认无误后再把 `dry_run=false`
 8. 最后视情况开启 `auto_poll=true`
@@ -58,6 +61,7 @@
 - `/bili_probe`
 - `/bili_scan_debug`
 - `/bili_scan_mentions`
+- `/bili_msg_debug`
 
 ### 第二步：演练回复
 - 保持 `dry_run=true`
