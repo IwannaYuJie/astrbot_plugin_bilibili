@@ -168,7 +168,7 @@ JNrRuoEUXpabUzGB8QIDAQAB
         if not self.refresh_token:
             raise ValueError("未配置 refresh_token")
         refresh_info = await self.get_cookie_refresh_info()
-        data_info = refresh_info.get("data", {}) if isinstance(refresh_info, dict) else {}
+        data_info = (refresh_info.get("data") or {}) if isinstance(refresh_info, dict) else {}
         timestamp_ms = int(data_info.get("timestamp", 0) or int(time.time() * 1000))
         refresh_csrf = await self.get_refresh_csrf(timestamp_ms)
         old_refresh_token = self.refresh_token
@@ -227,7 +227,7 @@ JNrRuoEUXpabUzGB8QIDAQAB
         if self._wbi_keys_cache is not None:
             return self._wbi_keys_cache
         nav = await self.get_login_info()
-        nav_data = nav.get("data", {}) if isinstance(nav, dict) else {}
+        nav_data = (nav.get("data") or {}) if isinstance(nav, dict) else {}
         wbi_img = nav_data.get("wbi_img", {}) if isinstance(nav_data, dict) else {}
         img_url = str(wbi_img.get("img_url", "") or "")
         sub_url = str(wbi_img.get("sub_url", "") or "")
@@ -496,7 +496,7 @@ class BilibiliReplyPlugin(Star):
             raise ValueError("未配置 bilibili_uid")
 
         nav = await client.get_login_info()
-        nav_data = nav.get("data", {}) if isinstance(nav, dict) else {}
+        nav_data = (nav.get("data") or {}) if isinstance(nav, dict) else {}
         self_mid = str(nav_data.get("mid", "") or "")
         self_uname = str(nav_data.get("uname", "") or "").strip()
 
@@ -852,7 +852,7 @@ class BilibiliReplyPlugin(Star):
             return
         try:
             info = await client.get_cookie_refresh_info()
-            data = info.get("data", {}) if isinstance(info, dict) else {}
+            data = (info.get("data") or {}) if isinstance(info, dict) else {}
             yield event.plain_result(
                 "Cookie 刷新状态\n"
                 f"- code: {info.get('code')}\n"
@@ -914,7 +914,7 @@ class BilibiliReplyPlugin(Star):
         try:
             nav = await client.get_login_info()
             nav_code = nav.get("code")
-            nav_data = nav.get("data", {}) if isinstance(nav, dict) else {}
+            nav_data = (nav.get("data") or {}) if isinstance(nav, dict) else {}
             uname = nav_data.get("uname", "未知")
             mid = nav_data.get("mid", "未知")
             is_login = nav_data.get("isLogin", False)
