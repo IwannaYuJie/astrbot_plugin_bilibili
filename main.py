@@ -283,12 +283,12 @@ JNrRuoEUXpabUzGB8QIDAQAB
         params = {"platform": "web", "build": 0, "mobi_app": "web", "web_location": 333.40164}
         return await self._request("GET", "https://api.bilibili.com/x/msgfeed/reply", params=params)
 
-    async def reply_to_comment(self, aid: str, root_id: str, parent_id: str, message: str) -> dict[str, Any]:
+    async def reply_to_comment(self, oid: str, reply_type: int, root_id: str, parent_id: str, message: str) -> dict[str, Any]:
         if not self.csrf_token:
             raise ValueError("Cookie 中缺少 bili_jct，无法发送回复")
         data = {
-            "type": 1,
-            "oid": aid,
+            "type": reply_type,
+            "oid": oid,
             "root": root_id,
             "parent": parent_id,
             "message": message,
@@ -636,6 +636,17 @@ class BilibiliReplyPlugin(Star):
         }
         return meta, triggers
 
+    def _infer_reply_type(self, trigger: BiliMessageTrigger) -> int:
+        business = (trigger.business or "").lower()
+        title = (trigger.title or "").lower()
+        if business in {"dynamic", "dyn", "reply", "opus"}:
+            return 11
+        if "动态" in trigger.title or "置顶" in trigger.title:
+            return 11
+        if business in {"archive", "video", "av"}:
+            return 1
+        return 1
+
     async def _generate_reply_for_trigger(self, trigger: BiliMessageTrigger) -> str:
         provider_id = self._provider_id_from_config()
         if not provider_id:
@@ -753,8 +764,11 @@ class BilibiliReplyPlugin(Star):
                     processed_now.append(history)
                     continue
 
+                reply_type = self._infer_reply_type(trigger)
+                history["reply_type"] = reply_type
                 result = await client.reply_to_comment(
-                    aid=trigger.oid,
+                    oid=trigger.oid,
+                    reply_type=reply_type,
                     root_id=trigger.root_id,
                     parent_id=trigger.parent_id or trigger.root_id,
                     message=reply_text,
