@@ -1,4 +1,4 @@
-# astrbot_plugin_bilibili
+# astrbot_plugin_bili_autoreply
 
 基于 AstrBot 的 B 站评论区自动回复插件。
 
@@ -85,7 +85,7 @@
 
 插件会在：
 
-- `data/plugin_data/astrbot_plugin_bilibili/`
+- `data/plugin_data/astrbot_plugin_bili_autoreply/`
 
 下生成：
 
@@ -127,3 +127,14 @@
 - 第一次执行 `/bili_run_once` 时，会先记录当前最新消息位置
 - 不会立即回复旧消息
 - 之后你再产生新的 @/回复，再执行 `/bili_run_once` 或开启 `auto_poll`，插件才会处理这些新消息
+
+## 插件改名说明
+
+为避免与 AstrBot 官方市场中已存在的 `astrbot_plugin_bilibili` 同名插件冲突，当前插件已改名为：
+
+- `astrbot_plugin_bili_autoreply`
+
+插件启动时会尽量从旧数据目录迁移已有状态文件：
+
+- 旧目录：`data/plugin_data/astrbot_plugin_bilibili/`
+- 新目录：`data/plugin_data/astrbot_plugin_bili_autoreply/`

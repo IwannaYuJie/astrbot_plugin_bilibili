@@ -72,7 +72,7 @@ AstrBot Core
  ├─ 插件配置（WebUI / _conf_schema.json）
  ├─ LLM Provider（已有 OpenAI / DeepSeek / 其他）
  ├─ 插件存储（KV / plugin_data）
- └─ 本插件 astrbot_plugin_bilibili
+ └─ 本插件 astrbot_plugin_bili_autoreply
       ├─ B站 API Client
       ├─ 评论轮询器 Poller
       ├─ 触发规则引擎 Rule Engine
@@ -250,14 +250,14 @@ AstrBot Core
 存储建议：
 
 - 小量配置：AstrBot 插件配置 / KV
-- 结构化运行数据：`data/plugin_data/astrbot_plugin_bilibili/`
+- 结构化运行数据：`data/plugin_data/astrbot_plugin_bili_autoreply/`
 
 ---
 
 ## 7. 数据目录建议
 
 ```text
-data/plugin_data/astrbot_plugin_bilibili/
+data/plugin_data/astrbot_plugin_bili_autoreply/
  ├─ state.json                # 基础运行状态
  ├─ processed_comments.json   # 已处理评论ID
  ├─ video_cache.json          # 视频列表缓存

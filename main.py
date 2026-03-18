@@ -297,12 +297,13 @@ JNrRuoEUXpabUzGB8QIDAQAB
         return await self._request("POST", "https://api.bilibili.com/x/v2/reply/add", data=data)
 
 
-@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件", "0.6.0")
+@register("astrbot_plugin_bili_autoreply", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件", "0.6.2")
 class BilibiliReplyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
         self.config = config or {}
-        self.plugin_data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_bilibili"
+        self.plugin_data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_bili_autoreply"
+        self.legacy_plugin_data_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_bilibili"
         self.state_file = self.plugin_data_dir / "state.json"
         self.processed_file = self.plugin_data_dir / "processed_comments.json"
         self.processed_msg_file = self.plugin_data_dir / "processed_messages.json"
@@ -316,16 +317,32 @@ class BilibiliReplyPlugin(Star):
         self._cycle_lock = asyncio.Lock()
 
     async def initialize(self):
+        self._migrate_legacy_data_if_needed()
         await self._ensure_state_file()
         self._load_processed_comments()
         if self._enabled() and self._auto_poll_enabled():
             self._start_auto_task()
-        logger.info("astrbot_plugin_bilibili initialized")
+        logger.info("astrbot_plugin_bili_autoreply initialized")
 
     async def terminate(self):
         await self._stop_auto_task()
         self._save_processed_comments()
-        logger.info("astrbot_plugin_bilibili terminated")
+        logger.info("astrbot_plugin_bili_autoreply terminated")
+
+    def _migrate_legacy_data_if_needed(self):
+        try:
+            if self.plugin_data_dir.exists() and any(self.plugin_data_dir.iterdir()):
+                return
+            if not self.legacy_plugin_data_dir.exists():
+                return
+            for item in self.legacy_plugin_data_dir.iterdir():
+                target = self.plugin_data_dir / item.name
+                if target.exists():
+                    continue
+                if item.is_file():
+                    target.write_bytes(item.read_bytes())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"迁移旧插件数据目录失败: {e}")
 
     async def _ensure_state_file(self):
         if not self.state_file.exists():
