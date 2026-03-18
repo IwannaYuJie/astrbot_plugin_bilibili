@@ -176,6 +176,10 @@ class BilibiliApiClient:
         params = {"type": 1, "oid": aid, "pn": page, "ps": page_size, "sort": 2}
         return await self._request("GET", "https://api.bilibili.com/x/v2/reply", params=params)
 
+    async def get_msg_feed_unread(self) -> dict[str, Any]:
+        params = {"platform": "web", "build": 0, "mobi_app": "web", "web_location": 333.40164}
+        return await self._request("GET", "https://api.bilibili.com/x/msgfeed/unread", params=params)
+
     async def get_msg_feed_at(self) -> dict[str, Any]:
         params = {"platform": "web", "build": 0, "mobi_app": "web", "web_location": 333.40164}
         return await self._request("GET", "https://api.bilibili.com/x/msgfeed/at", params=params)
@@ -427,13 +431,26 @@ class BilibiliReplyPlugin(Star):
         }
         return meta, previews
 
+    async def _fetch_message_debug_payload(self) -> dict[str, Any]:
+        client = self._build_client()
+        unread = await client.get_msg_feed_unread()
+        at_data = await client.get_msg_feed_at()
+        reply_data = await client.get_msg_feed_reply()
+        return {
+            "unread": unread,
+            "at": at_data,
+            "reply": reply_data,
+        }
+
     async def _scan_message_triggers(self) -> tuple[dict[str, Any], list[BiliMessageTrigger]]:
         client = self._build_client()
         if not client.is_configured():
             raise ValueError("未配置 bilibili_cookie")
 
-        at_data = await client.get_msg_feed_at()
-        reply_data = await client.get_msg_feed_reply()
+        payload = await self._fetch_message_debug_payload()
+        unread = payload["unread"]
+        at_data = payload["at"]
+        reply_data = payload["reply"]
 
         triggers: list[BiliMessageTrigger] = []
 
@@ -472,9 +489,20 @@ class BilibiliReplyPlugin(Star):
         _append_items(at_data, "at")
         _append_items(reply_data, "reply")
         triggers.sort(key=lambda x: x.ctime, reverse=True)
+        unread_data = unread.get("data", {}) if isinstance(unread, dict) else {}
         meta = {
+            "unread_code": unread.get("code") if isinstance(unread, dict) else None,
+            "unread_message": unread.get("message") if isinstance(unread, dict) else None,
+            "unread_at": unread_data.get("at", 0) if isinstance(unread_data, dict) else 0,
+            "unread_reply": unread_data.get("reply", 0) if isinstance(unread_data, dict) else 0,
+            "at_code": at_data.get("code") if isinstance(at_data, dict) else None,
+            "at_message": at_data.get("message") if isinstance(at_data, dict) else None,
+            "reply_code": reply_data.get("code") if isinstance(reply_data, dict) else None,
+            "reply_message": reply_data.get("message") if isinstance(reply_data, dict) else None,
             "at_count": len((at_data.get("data", {}) or {}).get("items", []) if isinstance(at_data, dict) else []),
             "reply_count": len((reply_data.get("data", {}) or {}).get("items", []) if isinstance(reply_data, dict) else []),
+            "at_cursor": (at_data.get("data", {}) or {}).get("cursor") if isinstance(at_data, dict) else None,
+            "reply_cursor": (reply_data.get("data", {}) or {}).get("cursor") if isinstance(reply_data, dict) else None,
             "trigger_count": len(triggers),
         }
         return meta, triggers
@@ -779,9 +807,19 @@ class BilibiliReplyPlugin(Star):
             return
         lines = [
             "B站消息中心 Debug",
+            f"- unread.code: {meta.get('unread_code')}",
+            f"- unread.message: {meta.get('unread_message')}",
+            f"- unread.at: {meta.get('unread_at', 0)}",
+            f"- unread.reply: {meta.get('unread_reply', 0)}",
+            f"- at.code: {meta.get('at_code')}",
+            f"- at.message: {meta.get('at_message')}",
+            f"- reply.code: {meta.get('reply_code')}",
+            f"- reply.message: {meta.get('reply_message')}",
             f"- at_items: {meta.get('at_count', 0)}",
             f"- reply_items: {meta.get('reply_count', 0)}",
             f"- usable_triggers: {meta.get('trigger_count', 0)}",
+            f"- at_cursor: {meta.get('at_cursor')}",
+            f"- reply_cursor: {meta.get('reply_cursor')}",
         ]
         if not triggers:
             lines.append("- 当前消息中心里没有可用于回复的新触发项。")
