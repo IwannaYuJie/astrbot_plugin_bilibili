@@ -110,3 +110,11 @@
 - 插件配置：<https://docs.astrbot.app/dev/star/guides/plugin-config.html>
 - 调用 AI：<https://docs.astrbot.app/dev/star/guides/ai.html>
 - 插件存储：<https://docs.astrbot.app/dev/star/guides/storage.html>
+
+## 首次运行说明
+
+为避免插件一上来把消息中心里的历史 @/回复 全部处理掉，当前版本加入了**首次消息基线**：
+
+- 第一次执行 `/bili_run_once` 时，会先记录当前最新消息位置
+- 不会立即回复旧消息
+- 之后你再产生新的 @/回复，再执行 `/bili_run_once` 或开启 `auto_poll`，插件才会处理这些新消息

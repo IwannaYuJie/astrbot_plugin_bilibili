@@ -211,10 +211,12 @@ class BilibiliReplyPlugin(Star):
         self.state_file = self.plugin_data_dir / "state.json"
         self.processed_file = self.plugin_data_dir / "processed_comments.json"
         self.processed_msg_file = self.plugin_data_dir / "processed_messages.json"
+        self.message_baseline_file = self.plugin_data_dir / "message_baseline.json"
         self.history_file = self.plugin_data_dir / "reply_history.jsonl"
         self.plugin_data_dir.mkdir(parents=True, exist_ok=True)
         self.processed_comments: set[str] = set()
         self.processed_messages: set[str] = set()
+        self.message_baseline: dict[str, Any] = {}
         self._auto_task: asyncio.Task | None = None
         self._cycle_lock = asyncio.Lock()
 
@@ -240,6 +242,8 @@ class BilibiliReplyPlugin(Star):
             self.processed_file.write_text("[]", encoding="utf-8")
         if not self.processed_msg_file.exists():
             self.processed_msg_file.write_text("[]", encoding="utf-8")
+        if not self.message_baseline_file.exists():
+            self.message_baseline_file.write_text("{}", encoding="utf-8")
         if not self.history_file.exists():
             self.history_file.write_text("", encoding="utf-8")
 
@@ -260,6 +264,14 @@ class BilibiliReplyPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"加载 processed_messages 失败: {e}")
             self.processed_messages = set()
+        try:
+            if self.message_baseline_file.exists():
+                data = json.loads(self.message_baseline_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self.message_baseline = data
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"加载 message_baseline 失败: {e}")
+            self.message_baseline = {}
 
     def _save_processed_comments(self):
         try:
@@ -276,6 +288,13 @@ class BilibiliReplyPlugin(Star):
             )
         except Exception as e:  # noqa: BLE001
             logger.warning(f"保存 processed_messages 失败: {e}")
+        try:
+            self.message_baseline_file.write_text(
+                json.dumps(self.message_baseline, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"保存 message_baseline 失败: {e}")
 
     def _append_history(self, item: dict[str, Any]):
         try:
@@ -554,14 +573,61 @@ class BilibiliReplyPlugin(Star):
             text = text[:max_chars]
         return f"{reply_prefix}{text}".strip()
 
+    def _dedupe_triggers(self, triggers: list[BiliMessageTrigger]) -> list[BiliMessageTrigger]:
+        deduped: list[BiliMessageTrigger] = []
+        seen: set[tuple[str, str, str]] = set()
+        for item in sorted(triggers, key=lambda x: (x.ctime, x.msg_id), reverse=True):
+            key = (item.oid, item.root_id, item.parent_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _is_after_baseline(self, trigger: BiliMessageTrigger) -> bool:
+        if not self.message_baseline:
+            return True
+        baseline_time = int(self.message_baseline.get("time", 0) or 0)
+        baseline_id = str(self.message_baseline.get("msg_id", "") or "")
+        if trigger.ctime > baseline_time:
+            return True
+        if trigger.ctime == baseline_time and baseline_id and trigger.msg_id > baseline_id:
+            return True
+        return False
+
+    def _ensure_message_baseline(self, triggers: list[BiliMessageTrigger]) -> bool:
+        if self.message_baseline:
+            return False
+        if not triggers:
+            self.message_baseline = {"time": int(time.time()), "msg_id": ""}
+        else:
+            newest = sorted(triggers, key=lambda x: (x.ctime, x.msg_id), reverse=True)[0]
+            self.message_baseline = {"time": newest.ctime, "msg_id": newest.msg_id}
+        self._save_processed_comments()
+        return True
+
     async def _process_one_cycle(self) -> dict[str, Any]:
         async with self._cycle_lock:
             meta, triggers = await self._scan_message_triggers()
-            candidates = [item for item in triggers if item.msg_id not in self.processed_messages]
+            triggers = self._dedupe_triggers(triggers)
+            baseline_initialized = self._ensure_message_baseline(triggers)
+            candidates = [
+                item for item in triggers
+                if item.msg_id not in self.processed_messages and self._is_after_baseline(item)
+            ]
             max_count = self._max_comments_per_cycle()
             dry_run = bool(self.config.get("dry_run", True))
             processed_now: list[dict[str, Any]] = []
             client = self._build_client()
+
+            if baseline_initialized:
+                return {
+                    "meta": meta,
+                    "candidates": len(candidates),
+                    "processed": [],
+                    "dry_run": dry_run,
+                    "baseline_initialized": True,
+                }
 
             for trigger in candidates[:max_count]:
                 reply_text = await self._generate_reply_for_trigger(trigger)
@@ -601,6 +667,7 @@ class BilibiliReplyPlugin(Star):
                 "candidates": len(candidates),
                 "processed": processed_now,
                 "dry_run": dry_run,
+                "baseline_initialized": False,
             }
 
     def _start_auto_task(self):
@@ -653,6 +720,7 @@ class BilibiliReplyPlugin(Star):
             f"- provider_id_configured: {bool(provider_id)}\n"
             f"- processed_comments: {len(self.processed_comments)}\n"
             f"- processed_messages: {len(self.processed_messages)}\n"
+            f"- message_baseline: {self.message_baseline}\n"
             f"- scan_video_limit: {self._scan_video_limit()}\n"
             f"- scan_comment_page_size: {self._scan_comment_page_size()}\n"
             f"- scan_comment_page_limit: {self._scan_comment_page_limit()}\n"
@@ -845,6 +913,7 @@ class BilibiliReplyPlugin(Star):
         lines = [
             "B站自动回复执行结果",
             f"- dry_run: {result['dry_run']}",
+            f"- baseline_initialized: {result.get('baseline_initialized', False)}",
             f"- matched_candidates: {result['candidates']}",
             f"- handled_count: {len(result['processed'])}",
         ]
@@ -854,8 +923,10 @@ class BilibiliReplyPlugin(Star):
                 f"- {item.get('status')} | {trigger.get('user_name')} | msg_id={trigger.get('msg_id')} | oid={trigger.get('oid')}\n"
                 f"  reply={item.get('reply_text', '')[:160]}"
             )
-        if not result["processed"]:
-            lines.append("- 本轮没有需要处理的新 @评论。")
+        if result.get("baseline_initialized"):
+            lines.append("- 已初始化消息基线；旧消息不会被回复。请在产生新 @/回复 后再次执行。")
+        elif not result["processed"]:
+            lines.append("- 本轮没有需要处理的新消息触发项。")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("bili_dry_run")
