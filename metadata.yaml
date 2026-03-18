@@ -1,7 +1,7 @@
 name: astrbot_plugin_bilibili
 display_name: B站评论回复助手
 desc: 基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）
-version: v0.5.2
+version: v0.6.0
 author: IwannaYuJie
 repo: https://github.com/IwannaYuJie/astrbot_plugin_bilibili
-astrbot_version: ">=4.16,<5"
+astrbot_version: v0.6.0

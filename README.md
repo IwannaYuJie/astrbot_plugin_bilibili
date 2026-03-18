@@ -24,6 +24,10 @@
   - 查看当前插件配置、运行状态、是否开启自动轮询、已处理评论数
 - `/bili_probe`
   - 探测登录态、WBI keys、视频列表接口是否正常
+- `/bili_cookie_status`
+  - 查看 Cookie 当前是否需要刷新
+- `/bili_refresh_cookie`
+  - 使用 `bilibili_refresh_token` 手动刷新 Cookie，并写回插件配置
 - `/bili_scan`
   - 扫描最近几条评论，预览评论与 `@你` 命中情况
 - `/bili_scan_mentions`

@@ -10,9 +10,12 @@ from datetime import datetime
 from hashlib import md5
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 
 import httpx
+from Crypto.Cipher import PKCS1_OAEP
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import RSA
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
@@ -71,9 +74,17 @@ class BilibiliApiClient:
         22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52,
     ]
 
-    def __init__(self, cookie: str, timeout: int = 20):
+    _COOKIE_REFRESH_PUBKEY = """-----BEGIN PUBLIC KEY-----
+MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDLgd2OAkcGVtoE3ThUREbio0Eg
+Uc/prcajMKXvkCKFCWhJYJcLkcM2DKKcSeFpD/j6Boy538YXnR6VhcuUJOhH2x71
+nzPjfdTcqMz7djHum0qSZA0AyCBDABUqCrfNgCiJ00Ra7GmRj+YCK1NJEuewlb40
+JNrRuoEUXpabUzGB8QIDAQAB
+-----END PUBLIC KEY-----"""
+
+    def __init__(self, cookie: str, timeout: int = 20, refresh_token: str = ""):
         self.cookie = cookie.strip()
         self.timeout = timeout
+        self.refresh_token = refresh_token.strip()
         self._nav_cache: dict[str, Any] | None = None
         self._wbi_keys_cache: tuple[str, str] | None = None
 
@@ -91,6 +102,23 @@ class BilibiliApiClient:
     @property
     def csrf_token(self) -> str:
         return self._parse_cookie(self.cookie).get("bili_jct", "")
+
+    def has_refresh_token(self) -> bool:
+        return bool(self.refresh_token)
+
+    def update_cookie_from_dict(self, cookie_dict: dict[str, str]):
+        current = self._parse_cookie(self.cookie)
+        current.update(cookie_dict)
+        self.cookie = "; ".join(f"{k}={v}" for k, v in current.items() if v is not None)
+        self._nav_cache = None
+        self._wbi_keys_cache = None
+
+    @classmethod
+    def _generate_correspond_path(cls, timestamp_ms: int) -> str:
+        key = RSA.import_key(cls._COOKIE_REFRESH_PUBKEY)
+        cipher = PKCS1_OAEP.new(key, hashAlgo=SHA256)
+        encrypted = cipher.encrypt(f"refresh_{timestamp_ms}".encode("utf-8"))
+        return encrypted.hex()
 
     def is_configured(self) -> bool:
         return bool(self.cookie)
@@ -117,6 +145,73 @@ class BilibiliApiClient:
         if self._nav_cache is None:
             self._nav_cache = await self._request("GET", "https://api.bilibili.com/x/web-interface/nav")
         return self._nav_cache
+
+    async def get_cookie_refresh_info(self) -> dict[str, Any]:
+        params = {"csrf": self.csrf_token} if self.csrf_token else {}
+        return await self._request("GET", "https://passport.bilibili.com/x/passport-login/web/cookie/info", params=params)
+
+    async def get_refresh_csrf(self, timestamp_ms: int | None = None) -> str:
+        ts = timestamp_ms or int(time.time() * 1000)
+        correspond_path = self._generate_correspond_path(ts)
+        url = f"https://www.bilibili.com/correspond/1/{quote(correspond_path, safe='')}"
+        cookies = self._parse_cookie(self.cookie)
+        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers(), cookies=cookies) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            html = response.text
+        match = re.search(r'<div id="1-name">([^<]+)</div>', html)
+        if not match:
+            raise ValueError("未能从 correspond 页面提取 refresh_csrf")
+        return match.group(1).strip()
+
+    async def refresh_cookie(self) -> dict[str, Any]:
+        if not self.refresh_token:
+            raise ValueError("未配置 refresh_token")
+        refresh_info = await self.get_cookie_refresh_info()
+        data_info = refresh_info.get("data", {}) if isinstance(refresh_info, dict) else {}
+        timestamp_ms = int(data_info.get("timestamp", 0) or int(time.time() * 1000))
+        refresh_csrf = await self.get_refresh_csrf(timestamp_ms)
+        old_refresh_token = self.refresh_token
+        cookies = self._parse_cookie(self.cookie)
+        payload = {
+            "csrf": self.csrf_token,
+            "refresh_csrf": refresh_csrf,
+            "source": "main_web",
+            "refresh_token": self.refresh_token,
+        }
+        async with httpx.AsyncClient(timeout=self.timeout, headers=self._headers(), cookies=cookies) as client:
+            response = await client.post(
+                "https://passport.bilibili.com/x/passport-login/web/cookie/refresh",
+                data=payload,
+            )
+            response.raise_for_status()
+            result = response.json()
+            response_cookies = {k: v for k, v in response.cookies.items()}
+        if result.get("code") != 0:
+            return {"ok": False, "stage": "refresh", "result": result}
+        if response_cookies:
+            self.update_cookie_from_dict(response_cookies)
+        new_refresh_token = str((result.get("data", {}) or {}).get("refresh_token", "") or "")
+        if new_refresh_token:
+            self.refresh_token = new_refresh_token
+        confirm_payload = {
+            "csrf": self.csrf_token,
+            "refresh_token": old_refresh_token,
+        }
+        confirm_result = await self._request(
+            "POST",
+            "https://passport.bilibili.com/x/passport-login/web/confirm/refresh",
+            data=confirm_payload,
+        )
+        return {
+            "ok": result.get("code") == 0 and confirm_result.get("code") == 0,
+            "stage": "done",
+            "refresh_info": refresh_info,
+            "refresh_result": result,
+            "confirm_result": confirm_result,
+            "new_refresh_token": self.refresh_token,
+            "new_cookie": self.cookie,
+        }
 
     @staticmethod
     def _extract_wbi_key(url: str) -> str:
@@ -202,7 +297,7 @@ class BilibiliApiClient:
         return await self._request("POST", "https://api.bilibili.com/x/v2/reply/add", data=data)
 
 
-@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件（基础骨架版）", "0.4.0")
+@register("astrbot_plugin_bilibili", "IwannaYuJie", "基于 AstrBot 的 B 站评论区自动回复插件", "0.6.0")
 class BilibiliReplyPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | None = None):
         super().__init__(context)
@@ -303,6 +398,20 @@ class BilibiliReplyPlugin(Star):
         except Exception as e:  # noqa: BLE001
             logger.warning(f"写入回复历史失败: {e}")
 
+    def _update_runtime_auth(self, *, cookie: str | None = None, refresh_token: str | None = None):
+        changed = False
+        if cookie is not None and cookie.strip():
+            self.config["bilibili_cookie"] = cookie.strip()
+            changed = True
+        if refresh_token is not None and refresh_token.strip():
+            self.config["bilibili_refresh_token"] = refresh_token.strip()
+            changed = True
+        if changed and hasattr(self.config, "save_config"):
+            try:
+                self.config.save_config()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"保存插件配置失败: {e}")
+
     def _enabled(self) -> bool:
         return bool(self.config.get("enabled", True))
 
@@ -312,7 +421,8 @@ class BilibiliReplyPlugin(Star):
     def _build_client(self) -> BilibiliApiClient:
         timeout = int(self.config.get("http_timeout_seconds", 20) or 20)
         cookie = str(self.config.get("bilibili_cookie", "") or "")
-        return BilibiliApiClient(cookie=cookie, timeout=timeout)
+        refresh_token = str(self.config.get("bilibili_refresh_token", "") or "")
+        return BilibiliApiClient(cookie=cookie, timeout=timeout, refresh_token=refresh_token)
 
     def _provider_id_from_config(self) -> str:
         return str(self.config.get("provider_id", "") or "").strip()
@@ -718,6 +828,7 @@ class BilibiliReplyPlugin(Star):
             f"- bilibili_uid_configured: {bool(uid)}\n"
             f"- bilibili_cookie_configured: {bool(cookie)}\n"
             f"- provider_id_configured: {bool(provider_id)}\n"
+            f"- refresh_token_configured: {bool(str(self.config.get('bilibili_refresh_token', '') or '').strip())}\n"
             f"- processed_comments: {len(self.processed_comments)}\n"
             f"- processed_messages: {len(self.processed_messages)}\n"
             f"- message_baseline: {self.message_baseline}\n"
@@ -731,6 +842,63 @@ class BilibiliReplyPlugin(Star):
     async def bili_status(self, event: AstrMessageEvent):
         """查看插件当前基础状态。"""
         yield event.plain_result(self._base_status_text())
+
+    @filter.command("bili_cookie_status")
+    async def bili_cookie_status(self, event: AstrMessageEvent):
+        """查看 Cookie 是否需要刷新。"""
+        client = self._build_client()
+        if not client.is_configured():
+            yield event.plain_result("未配置 bilibili_cookie。")
+            return
+        try:
+            info = await client.get_cookie_refresh_info()
+            data = info.get("data", {}) if isinstance(info, dict) else {}
+            yield event.plain_result(
+                "Cookie 刷新状态\n"
+                f"- code: {info.get('code')}\n"
+                f"- message: {info.get('message')}\n"
+                f"- need_refresh: {data.get('refresh')}\n"
+                f"- timestamp: {data.get('timestamp')}\n"
+                f"- refresh_token_configured: {client.has_refresh_token()}"
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("查询 Cookie 刷新状态失败")
+            yield event.plain_result(f"查询失败：{e}")
+
+    @filter.command("bili_refresh_cookie")
+    async def bili_refresh_cookie(self, event: AstrMessageEvent):
+        """手动刷新 Cookie，并写回插件配置。"""
+        client = self._build_client()
+        if not client.is_configured():
+            yield event.plain_result("未配置 bilibili_cookie。")
+            return
+        if not client.has_refresh_token():
+            yield event.plain_result("未配置 bilibili_refresh_token，无法刷新。")
+            return
+        try:
+            result = await client.refresh_cookie()
+            if result.get("ok"):
+                self._update_runtime_auth(
+                    cookie=result.get("new_cookie"),
+                    refresh_token=result.get("new_refresh_token"),
+                )
+                yield event.plain_result(
+                    "Cookie 刷新成功\n"
+                    f"- refresh.code: {((result.get('refresh_result') or {}).get('code'))}\n"
+                    f"- confirm.code: {((result.get('confirm_result') or {}).get('code'))}\n"
+                    f"- refresh_token_updated: {bool(result.get('new_refresh_token'))}"
+                )
+            else:
+                refresh_result = result.get("result") or result.get("refresh_result") or {}
+                yield event.plain_result(
+                    "Cookie 刷新失败\n"
+                    f"- stage: {result.get('stage')}\n"
+                    f"- code: {refresh_result.get('code')}\n"
+                    f"- message: {refresh_result.get('message')}"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.exception("刷新 Cookie 失败")
+            yield event.plain_result(f"刷新失败：{e}")
 
     @filter.command("bili_probe")
     async def bili_probe(self, event: AstrMessageEvent):
